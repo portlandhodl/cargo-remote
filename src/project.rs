@@ -10,18 +10,6 @@ pub struct Project {
     pub name: String,
 }
 
-/// Per-project config file `.cargo-remote.toml` in the workspace root:
-///
-/// ```toml
-/// host = "my-server"
-/// cargo_path = "~/.cargo/bin/cargo"
-/// ```
-#[derive(Debug, Default, serde::Deserialize)]
-pub struct ProjectConfig {
-    pub host: Option<String>,
-    pub cargo_path: Option<String>,
-}
-
 impl Project {
     /// Find the workspace root containing `dir` (via `cargo locate-project`,
     /// falling back to walking up the directory tree).
@@ -42,20 +30,6 @@ impl Project {
             .unwrap_or_else(|| "project".to_string());
 
         Ok(Project { root, name })
-    }
-
-    pub fn load_config(&self) -> anyhow::Result<ProjectConfig> {
-        let path = self.root.join(".cargo-remote.toml");
-        match std::fs::read_to_string(&path) {
-            Ok(text) => {
-                let cfg: ProjectConfig = toml::from_str(&text).map_err(|e| {
-                    anyhow::anyhow!("invalid {}: {e}", path.display())
-                })?;
-                Ok(cfg)
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ProjectConfig::default()),
-            Err(e) => Err(e.into()),
-        }
     }
 
     /// Local target/<profile> dir for copy-back.

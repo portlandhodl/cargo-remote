@@ -22,6 +22,15 @@ use tokio::sync::mpsc;
 /// A connected, authenticated SSH session.
 pub struct Ssh {
     handle: Handle<HostKeyHandler>,
+    info: ConnInfo,
+}
+
+/// Resolved connection parameters, for status display.
+pub struct ConnInfo {
+    /// Resolved hostname or IP (after ~/.ssh/config).
+    pub host: String,
+    pub port: u16,
+    pub user: String,
 }
 
 /// Channel type used for exec/agent sessions.
@@ -187,7 +196,19 @@ impl Ssh {
 
         authenticate(&mut handle, alias, &user, &cfg).await?;
 
-        Ok(Ssh { handle })
+        Ok(Ssh {
+            handle,
+            info: ConnInfo {
+                host: hostname,
+                port,
+                user,
+            },
+        })
+    }
+
+    /// Resolved connection parameters (config alias already applied).
+    pub fn info(&self) -> &ConnInfo {
+        &self.info
     }
 
     /// Open a session channel running `cmd` (no pty).

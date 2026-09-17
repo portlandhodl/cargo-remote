@@ -56,7 +56,7 @@ $ cargo remote -r my-server test     # sync, run the test suite on the server
 ```
 
 Host resolution order: `-r/--remote <HOST>`, then `$CARGO_REMOTE_HOST`, then
-`host = "..."` in `.cargo-remote.toml` in the workspace root.
+`host = "..."` in a config file (see below).
 
 Everything after the subcommand is passed through to cargo:
 
@@ -74,7 +74,12 @@ $ cargo remote -r my-server test -- --nocapture
 | `test` / `run` / `bench` / `doc` | Sync, then the matching cargo subcommand on the server |
 | `clean` | `cargo clean` on the remote (clears the remote build cache) |
 | `sync` | Only sync sources (pre-warm the remote cache, no build) |
+| `probe` | Test a host for support: connection, auth, platform, toolchain, agent, disk |
 | `hosts` | List host names found in `~/.ssh/config` |
+| *anything else* | Passed through as a cargo extension: `cargo remote nextest run` syncs, then runs `cargo nextest run` on the server (the extension must be installed on the remote) |
+
+Full reference: [docs/commands.md](docs/commands.md) (index:
+[docs/README.md](docs/README.md)).
 
 Useful flags: `-n/--dry-run` shows what would run, `-v/--verbose` shows each
 step, `--env KEY=VALUE` sets remote environment variables, `--toolchain NAME`
@@ -109,12 +114,27 @@ selects a rustup toolchain on the server, `--exclude-git` also skips `.git/`,
 
 ## Configuration
 
-`.cargo-remote.toml` (workspace root):
+cargo-remote can run flag-free: put settings in a config file once and
+`cargo remote build` is the whole command line. Config files, lowest to
+highest precedence:
+
+1. `~/.config/cargo-remote/config.toml` — global defaults for all projects
+2. `.config/cargo-remote.toml` — per project (nextest-style location)
+3. `.cargo-remote.toml` — per project, workspace root
+
+A minimal per-project config is just:
 
 ```toml
-host = "my-server"
-cargo_path = "~/.cargo/bin/cargo"
+# .config/cargo-remote.toml
+host = "my-server"    # an alias from ~/.ssh/config or a plain host name
 ```
+
+All keys — `remote_dir`, `cargo_path`, `transfer`, `copy_back`, `sync`,
+`exclude_git`, `exclude`, `env`, `toolchain`, `verbose`, `sync_status`,
+`arch`, `min_rust_version` — are documented in
+[docs/configuration.md](docs/configuration.md), including how to pin the
+remote architecture and toolchain so compiled outputs always match your
+machine.
 
 Environment variables: `CARGO_REMOTE_HOST` (default host),
 `CARGO_REMOTE_CARGO` (default cargo path), `RUSTFLAGS` (forwarded).

@@ -56,6 +56,24 @@ pub enum Transfer {
 }
 
 impl Transfer {
+    /// Short name for status display ("tar-gz", "delta", ...).
+    pub fn name(&self) -> &'static str {
+        match self {
+            Transfer::Auto => "auto",
+            Transfer::Delta => "delta",
+            Transfer::Tar {
+                compressor: Compressor::None,
+            } => "tar",
+            Transfer::Tar {
+                compressor: Compressor::Gzip,
+            } => "tar-gz",
+            Transfer::Tar {
+                compressor: Compressor::Zstd,
+            } => "tar-zstd",
+            Transfer::TarIncremental => "tar-inc",
+        }
+    }
+
     pub async fn sync(&self, ctx: &Context) -> Result<()> {
         match self {
             Transfer::Auto => auto_sync(ctx).await,

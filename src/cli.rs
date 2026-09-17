@@ -10,6 +10,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 ///   cargo remote -r my-server build --release
 ///   cargo remote build -r my-server -- --features foo
 ///   cargo remote -r my-server test
+///   cargo remote nextest run --profile fast   # any cargo extension works
 ///   cargo remote hosts
 #[derive(Parser, Debug)]
 #[command(name = "cargo-remote", bin_name = "cargo remote", version, about, long_about)]
@@ -83,6 +84,12 @@ pub enum Command {
         #[command(flatten)]
         opts: RemoteOpts,
     },
+    /// Probe a host for cargo-remote support: connection, auth, platform,
+    /// toolchain, transfer tools, sync agent, remote dir and disk space.
+    Probe {
+        #[command(flatten)]
+        opts: RemoteOpts,
+    },
     /// List host names found in ~/.ssh/config.
     Hosts,
     /// (internal) Run as the remote sync agent. Not for direct use.
@@ -92,6 +99,13 @@ pub enum Command {
         #[arg(long)]
         version: bool,
     },
+    /// Run any other cargo subcommand on the remote (cargo extensions).
+    ///
+    /// `cargo remote nextest run` syncs sources and runs `cargo nextest run`
+    /// on the server; the extension (e.g. cargo-nextest) must be installed
+    /// on the remote. Options like -r must come before the subcommand.
+    #[command(external_subcommand)]
+    Ext(Vec<String>),
 }
 
 /// Options that can appear either globally (before the subcommand) or on the
@@ -100,7 +114,8 @@ pub enum Command {
 pub struct RemoteOpts {
     /// SSH host, as named in ~/.ssh/config.
     ///
-    /// Falls back to $CARGO_REMOTE_HOST, then `host` in .cargo-remote.toml.
+    /// Falls back to $CARGO_REMOTE_HOST, then `host` in a cargo-remote
+    /// config file (.config/cargo-remote.toml, .cargo-remote.toml, global).
     #[arg(short, long, value_name = "HOST", global = false)]
     pub remote: Option<String>,
 
@@ -190,7 +205,8 @@ impl RemoteOpts {
     }
 }
 
-#[derive(ValueEnum, Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(ValueEnum, Debug, Default, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum TransferMode {
     /// Pick automatically: tar-gz stream when the remote dir is empty, delta sync after.
     #[default]
