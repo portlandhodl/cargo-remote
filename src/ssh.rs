@@ -16,7 +16,7 @@ use russh::keys::agent::client::AgentClient;
 use russh::keys::known_hosts::{check_known_hosts_path, learn_known_hosts_path};
 use russh::keys::{HashAlg, PrivateKeyWithHashAlg, PublicKeyOrCertificate, load_secret_key, ssh_key};
 use russh::{Channel, ChannelMsg};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
 /// A connected, authenticated SSH session.
@@ -225,24 +225,34 @@ impl Ssh {
 
         let (mut rd, wr) = ch.split();
         let stdin_task = if pty {
-            Some(tokio::spawn(async move {
-                let mut stdin = tokio::io::stdin();
+            // Read stdin on a plain OS thread instead of tokio::io::stdin():
+            // the latter uses an uncancellable blocking read that keeps the
+            // runtime's blocking pool busy, so the process would hang on
+            // shutdown whenever the terminal stdin never sends EOF.
+            let (tx, mut rx) = mpsc::channel::<bytes::Bytes>(8);
+            std::thread::spawn(move || {
+                use std::io::Read as _;
+                let mut stdin = std::io::stdin().lock();
                 let mut buf = [0u8; 16 * 1024];
                 loop {
-                    match stdin.read(&mut buf).await {
-                        Ok(0) => {
-                            let _ = wr.eof().await;
-                            return;
-                        }
+                    match stdin.read(&mut buf) {
+                        Ok(0) => return,
                         Ok(n) => {
-                            if wr.data_bytes(bytes::Bytes::copy_from_slice(&buf[..n])).await.is_err()
-                            {
+                            if tx.blocking_send(bytes::Bytes::copy_from_slice(&buf[..n])).is_err() {
                                 return;
                             }
                         }
                         Err(_) => return,
                     }
                 }
+            });
+            Some(tokio::spawn(async move {
+                while let Some(b) = rx.recv().await {
+                    if wr.data_bytes(b).await.is_err() {
+                        return;
+                    }
+                }
+                let _ = wr.eof().await;
             }))
         } else {
             None
