@@ -112,3 +112,16 @@ fn unknown_subcommand_fails() {
     let out = run(&["frobnicate"], None);
     assert!(!out.status.success());
 }
+
+#[test]
+fn no_sync_status_flag_accepted() {
+    let proj = TempProject::new("demo5");
+    let out = run(
+        &["-r", "h", "-n", "--no-sync-status", "sync"],
+        Some(&proj.0),
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    // Piped stderr is not a terminal, so no progress output either way.
+    let err = stderr(&out);
+    assert!(err.contains("sync"), "missing sync step: {err}");
+}

@@ -28,6 +28,9 @@ $ ./target/release/mycrate --help        # the binary is back on your machine
   verification against `~/.ssh/known_hosts`, ssh-agent authentication.
 - **Feels local** — builds get a PTY when your terminal is interactive, so
   colors, progress bars and Ctrl-C behave as expected.
+- **Live sync status** — while syncing you see bytes, percentage, throughput
+  and ETA on a single updating line (only on a terminal; turn it off with
+  `--no-sync-status`).
 
 ## Installation
 
@@ -75,7 +78,8 @@ $ cargo remote -r my-server test -- --nocapture
 
 Useful flags: `-n/--dry-run` shows what would run, `-v/--verbose` shows each
 step, `--env KEY=VALUE` sets remote environment variables, `--toolchain NAME`
-selects a rustup toolchain on the server, `--exclude-git` also skips `.git/`.
+selects a rustup toolchain on the server, `--exclude-git` also skips `.git/`,
+`--no-sync-status` disables the live sync progress display.
 
 ## How it works
 

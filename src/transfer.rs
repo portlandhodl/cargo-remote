@@ -14,6 +14,7 @@ use anyhow::{Context as _, Result, bail};
 use tokio::sync::mpsc;
 
 use crate::agent::Agent;
+use crate::progress::Progress;
 use crate::runner::{Context, shell_join};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,23 +107,23 @@ async fn delta_sync(ctx: &Context) -> Result<()> {
     match ctx.ensure_agent().await? {
         Some(agent_q) => {
             let mut agent = Agent::start(ctx.require_ssh()?, &agent_q).await?;
+            let mut progress = Progress::new("sync", &ctx.runner);
             let stats = agent
                 .sync(
                     &ctx.project.root,
                     &ctx.remote_dir(),
                     &ctx.excludes(),
                     true,
+                    &mut progress,
                 )
                 .await?;
             agent.quit().await?;
-            if ctx.runner.verbose {
-                eprintln!(
-                    "cargo-remote: sync: {} files changed, {} sent ({} full size)",
-                    stats.files,
-                    human(stats.sent_bytes),
-                    human(stats.full_bytes)
-                );
-            }
+            progress.finish(&format!(
+                "{} files changed, {} sent ({} full size)",
+                stats.files,
+                human(stats.sent_bytes),
+                human(stats.full_bytes)
+            ));
             Ok(())
         }
         None => {
@@ -212,11 +213,19 @@ async fn tar_sync(
 
     let ssh = ctx.require_ssh()?;
     let (tx, rx) = mpsc::channel::<bytes::Bytes>(8);
-    let verbose = ctx.runner.verbose;
     let incremental = incremental_snapshot.is_some();
-    let producer = std::thread::spawn(move || {
-        run_tar_pipeline(tar_args, compressor, incremental, tx, verbose)
-    });
+    let label = if incremental {
+        "sync (tar-inc)".to_string()
+    } else {
+        match compressor {
+            Compressor::None => "sync (tar)".to_string(),
+            Compressor::Gzip => "sync (tar-gz)".to_string(),
+            Compressor::Zstd => "sync (tar-zstd)".to_string(),
+        }
+    };
+    let progress = Progress::new(&label, &ctx.runner);
+    let producer =
+        std::thread::spawn(move || run_tar_pipeline(tar_args, compressor, incremental, tx, progress));
     let code = ssh.exec_send(&remote, rx).await?;
     producer
         .join()
@@ -233,7 +242,7 @@ fn run_tar_pipeline(
     compressor: Compressor,
     incremental: bool,
     tx: mpsc::Sender<bytes::Bytes>,
-    verbose: bool,
+    mut progress: Progress,
 ) -> Result<()> {
     use std::io::Read;
     use std::process::{Command, Stdio};
@@ -273,6 +282,7 @@ fn run_tar_pipeline(
             break;
         }
         total += n as u64;
+        progress.add_wire(n as u64);
         if tx.blocking_send(bytes::Bytes::copy_from_slice(&buf[..n])).is_err() {
             break; // receiver gone (remote failed)
         }
@@ -284,9 +294,7 @@ fn run_tar_pipeline(
         anyhow::ensure!(st.success(), "{comp_prog} failed: {st}");
     }
     anyhow::ensure!(tar_status.success(), "tar failed: {tar_status}");
-    if verbose {
-        eprintln!("cargo-remote: tar stream sent {} (pre-ssh)", human(total));
-    }
+    progress.finish(&format!("{} streamed", human(total)));
     Ok(())
 }
 

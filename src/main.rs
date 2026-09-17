@@ -1,5 +1,6 @@
 mod agent;
 mod cli;
+mod progress;
 mod project;
 mod rsync;
 mod runner;
@@ -128,6 +129,9 @@ async fn build_context(global: &RemoteOpts, local: &RemoteOpts) -> anyhow::Resul
 
     let interactive = std::io::stdout().is_terminal() && std::io::stdin().is_terminal();
 
+    // Live sync status only on an interactive stderr, unless disabled.
+    let sync_status = !opts.no_sync_status && std::io::stderr().is_terminal();
+
     let transfer = match opts.transfer.unwrap_or_default() {
         TransferMode::Auto => Transfer::Auto,
         TransferMode::Rsync | TransferMode::RsyncZ => Transfer::Delta,
@@ -154,6 +158,7 @@ async fn build_context(global: &RemoteOpts, local: &RemoteOpts) -> anyhow::Resul
         Runner {
             dry_run: opts.dry_run,
             verbose: opts.verbose,
+            sync_status,
         },
         project,
         host,

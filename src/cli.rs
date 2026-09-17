@@ -151,6 +151,14 @@ pub struct RemoteOpts {
     /// Echo each command as it runs.
     #[arg(short, long)]
     pub verbose: bool,
+
+    /// Disable the live sync progress display (bytes, speed, percentage).
+    ///
+    /// Progress is shown on stderr while syncing when it is a terminal;
+    /// this flag turns it off (useful for screen recording or flaky
+    /// terminals). Non-terminal output never shows progress.
+    #[arg(long)]
+    pub no_sync_status: bool,
 }
 
 impl RemoteOpts {
@@ -169,6 +177,7 @@ impl RemoteOpts {
             dry_run: other.dry_run || self.dry_run,
             verbose: other.verbose || self.verbose,
             no_copy_back: other.no_copy_back || self.no_copy_back,
+            no_sync_status: other.no_sync_status || self.no_sync_status,
         }
         .apply_no_copy_back()
     }

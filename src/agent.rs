@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::progress::Progress;
 use crate::rsync;
 use crate::ssh::Ssh;
 
@@ -424,15 +425,19 @@ impl Agent {
         Ok(())
     }
 
-    /// Sync `local_root` to `remote_root` on the agent's host.
+    /// Sync `local_root` to `remote_root` on the agent's host, reporting
+    /// live status to `progress`.
     pub async fn sync(
         &mut self,
         local_root: &Path,
         remote_root: &str,
         excludes: &[String],
         delete: bool,
+        progress: &mut Progress,
     ) -> Result<SyncStats> {
+        progress.status("scanning local files...");
         let local = walk(local_root, excludes)?;
+        progress.status("fetching remote file list...");
         self.io
             .write_json(
                 tag::SYNC_REQ,
@@ -494,6 +499,14 @@ impl Agent {
             });
         }
 
+        let total_files = sends.iter().filter(|m| m.kind == KIND_FILE).count() as u64;
+        let total_bytes: u64 = sends
+            .iter()
+            .filter(|m| m.kind == KIND_FILE)
+            .map(|m| m.len)
+            .sum();
+        progress.set_totals(Some(total_bytes), Some(total_files));
+
         // Execute the plan.
         if !mkdirs.is_empty() {
             self.io
@@ -507,9 +520,16 @@ impl Agent {
         }
 
         // Collect signatures (agent answers with exactly one SIG per path).
+        // The remote reads and checksums each file, so this can take a
+        // while on large trees: report it as its own phase.
         let mut sigs: std::collections::HashMap<String, (u32, Vec<rsync::BlockSig>)> =
             std::collections::HashMap::new();
-        for _ in &sig_wanted {
+        for (i, _) in sig_wanted.iter().enumerate() {
+            progress.status(&format!(
+                "collecting remote signatures: {}/{}",
+                i + 1,
+                sig_wanted.len()
+            ));
             let (t, payload) = self.expect(tag::SIG).await?;
             let _ = t;
             let (hdr, data): (SigHdr, _) = unpack_hdr(&payload)?;
@@ -520,6 +540,7 @@ impl Agent {
                 );
             }
         }
+        progress.clear_status();
 
         let mut stats = SyncStats {
             files: 0,
@@ -565,6 +586,8 @@ impl Agent {
             };
             stats.sent_bytes += payload.len() as u64;
             self.io.write_frame(tag::PUT, &payload).await?;
+            progress.advance(data.len() as u64, payload.len() as u64);
+            progress.inc_file();
         }
 
         if !deletes.is_empty() {
@@ -585,13 +608,15 @@ impl Agent {
     }
 
     /// Fetch `rel_paths` (relative to `remote_root`) into `dest_dir` (by
-    /// basename), using deltas against existing local files.
+    /// basename), using deltas against existing local files, reporting
+    /// live status to `progress`.
     /// Returns the basenames written.
     pub async fn fetch(
         &mut self,
         remote_root: &str,
         rel_paths: &[String],
         dest_dir: &Path,
+        progress: &mut Progress,
     ) -> Result<Vec<String>> {
         self.io
             .write_json(
@@ -603,7 +628,12 @@ impl Agent {
             )
             .await?;
         // Send one signature per requested file (empty when we have no basis).
-        for rel in rel_paths {
+        for (i, rel) in rel_paths.iter().enumerate() {
+            progress.status(&format!(
+                "computing local signatures: {}/{}",
+                i + 1,
+                rel_paths.len()
+            ));
             let local = dest_dir.join(basename(rel));
             let (sig, bl) = match std::fs::read(&local) {
                 Ok(old) if !old.is_empty() => {
@@ -620,10 +650,13 @@ impl Agent {
                 .write_frame(tag::FETCH_SIG, &pack_hdr(&hdr, &sig)?)
                 .await?;
         }
+        progress.clear_status();
 
         let mut written = Vec::new();
         for _ in rel_paths {
             let (_, payload) = self.expect(tag::FETCHED).await?;
+            progress.add_wire(payload.len() as u64);
+            progress.inc_file();
             let (hdr, data): (FileHdr, _) = unpack_hdr(&payload)?;
             if !hdr.exists {
                 eprintln!("cargo-remote: {} vanished on remote, skipped", hdr.path);

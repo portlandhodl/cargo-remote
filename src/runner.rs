@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use anyhow::{Context as _, Result, bail};
 
 use crate::agent::{Agent, PROTOCOL_VERSION, version_string};
+use crate::progress::Progress;
 use crate::project::{CargoSubcommand, Project, profile_from_args};
 use crate::ssh::Ssh;
 use crate::transfer::{Transfer, human};
@@ -11,6 +12,8 @@ use crate::transfer::{Transfer, human};
 pub struct Runner {
     pub dry_run: bool,
     pub verbose: bool,
+    /// Show the live sync status line (stderr is a TTY, not `--no-sync-status`).
+    pub sync_status: bool,
 }
 
 impl Runner {
@@ -236,25 +239,34 @@ impl Context {
         // Upload ourselves.
         let exe = std::env::current_exe().context("locate own binary")?;
         let data = std::fs::read(&exe).with_context(|| format!("read {}", exe.display()))?;
+        let total = data.len() as u64;
         eprintln!(
             "cargo-remote: installing sync agent on {} ({}, protocol v{PROTOCOL_VERSION})",
             self.host,
-            human(data.len() as u64)
+            human(total)
         );
         let tmp_q = format!("{path_q}.tmp.{}", std::process::id());
         let cmd = format!("mkdir -p {dir_q} && cat > {tmp_q} && chmod 755 {tmp_q} && mv -f {tmp_q} {path_q}");
         let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(8);
-        tokio::spawn(async move {
+        let mut progress = Progress::new("agent", &self.runner);
+        progress.set_totals(Some(total), None);
+        let send = tokio::spawn(async move {
             for chunk in data.chunks(256 * 1024) {
                 if tx.send(bytes::Bytes::copy_from_slice(chunk)).await.is_err() {
                     break;
                 }
+                progress.advance(chunk.len() as u64, chunk.len() as u64);
             }
+            progress
         });
         let code = ssh.exec_send(&cmd, rx).await?;
+        let progress = send
+            .await
+            .map_err(|_| anyhow::anyhow!("agent upload task panicked"))?;
         if code != 0 {
             bail!("agent upload failed with exit code {code}");
         }
+        progress.finish(&format!("uploaded {}", human(total)));
         Ok(Some(path_q))
     }
 
@@ -293,9 +305,13 @@ impl Context {
             eprintln!("cargo-remote: no binaries found in remote target/{profile} (library crate?)");
         } else {
             std::fs::create_dir_all(&dest)?;
+            let mut progress = Progress::new("copy-back", &self.runner);
+            progress.set_totals(None, Some(files.len() as u64));
             let names = if let Some(agent_q) = self.ensure_agent().await? {
                 let mut agent = Agent::start(ssh, &agent_q).await?;
-                let got = agent.fetch(&self.remote_dir(), &files, &dest).await?;
+                let got = agent
+                    .fetch(&self.remote_dir(), &files, &dest, &mut progress)
+                    .await?;
                 agent.quit().await?;
                 got
             } else {
@@ -306,10 +322,17 @@ impl Context {
                     let src = format!("{}/{}", self.remote_dir(), f);
                     ssh.exec_download(&format!("cat {}", self.quote_remote(&src)), &dest.join(&name))
                         .await?;
+                    let size = std::fs::metadata(dest.join(&name))
+                        .map(|m| m.len())
+                        .unwrap_or(0);
+                    progress.add_wire(size);
+                    progress.inc_file();
                     got.push(name);
                 }
                 got
             };
+            let received = progress.wire();
+            progress.finish(&format!("{} files, {} received", names.len(), human(received)));
             if self.runner.verbose {
                 for n in &names {
                     eprintln!("copied back: {}", dest.join(n).display());
