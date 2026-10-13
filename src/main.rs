@@ -10,6 +10,7 @@ mod sshcfg;
 mod transfer;
 
 use std::io::IsTerminal;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
@@ -51,7 +52,7 @@ async fn run(cli: Cli) -> anyhow::Result<u8> {
     match cli.command {
         Command::Agent { version } => {
             if version {
-                println!("{}", agent::version_string());
+                println!("{}", agent::version_line()?);
                 return Ok(0);
             }
             agent::serve().await?;
@@ -265,6 +266,11 @@ async fn build_context(global: &RemoteOpts, local: &RemoteOpts, connect: bool) -
         arch: cfg.arch.clone(),
         min_rust_version: cfg.min_rust_version.clone(),
     };
+    // Serialize concurrent runs on the same project+host (shared snapshot
+    // files, remote build dir). Dry-run/probe take no lock.
+    if connect && !opts.dry_run {
+        ctx._run_lock = Some(acquire_run_lock(&ctx.host, &ctx.project.name)?);
+    }
     Ok(ctx)
 }
 
@@ -328,6 +334,86 @@ fn host_status_lines(
 
 fn default_cargo_path() -> String {
     std::env::var("CARGO_REMOTE_CARGO").unwrap_or_else(|_| "$HOME/.cargo/bin/cargo".to_string())
+}
+
+/// Held for the duration of a mutating run so two cargo-remote processes on
+/// the same project+host cannot corrupt shared state (the incremental-sync
+/// snapshot, same-name temp files, the remote build dir).
+pub struct RunLock(PathBuf);
+
+impl Drop for RunLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn acquire_run_lock(host: &str, project: &str) -> anyhow::Result<RunLock> {
+    let home =
+        std::env::home_dir().ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
+    let dir = home.join(".cache/cargo-remote/locks");
+    acquire_run_lock_in(&dir, host, project)
+}
+
+fn acquire_run_lock_in(dir: &Path, host: &str, project: &str) -> anyhow::Result<RunLock> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        if let Some(base) = dir.parent() {
+            let _ = std::fs::set_permissions(base, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    let sane: String = host
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let path = dir.join(format!("{sane}-{project}.lock"));
+    let try_create = || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+    };
+    match try_create() {
+        Ok(mut f) => {
+            use std::io::Write as _;
+            let _ = write!(f, "{}", std::process::id());
+            Ok(RunLock(path))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            #[cfg(unix)]
+            {
+                // Reclaim a stale lock left by a dead process.
+                let pid: Option<i32> = std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|s| s.trim().parse().ok());
+                let alive = pid.is_some_and(|p| {
+                    let rc = unsafe { libc::kill(p, 0) };
+                    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+                });
+                if !alive {
+                    let _ = std::fs::remove_file(&path);
+                    if let Ok(f) = try_create() {
+                        let _ = f;
+                        return Ok(RunLock(path));
+                    }
+                }
+            }
+            anyhow::bail!(
+                "another cargo-remote run holds the lock for {host}/{project} ({}).\n  \
+                 If the other run crashed, delete that file.",
+                path.display()
+            )
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 #[cfg(test)]
@@ -395,6 +481,36 @@ mod tests {
         );
         assert_eq!(lines.len(), 2);
         assert_eq!(lines[1], "cargo-remote: env sent: FOO=bar TOKEN=s3cret");
+    }
+
+    #[test]
+    fn run_lock_is_exclusive_and_released() {
+        let dir = std::env::temp_dir().join(format!("cr-lock-t-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let a = acquire_run_lock_in(&dir, "h", "proj").unwrap();
+        let err = match acquire_run_lock_in(&dir, "h", "proj") {
+            Ok(_) => panic!("second lock acquire must fail"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("another cargo-remote run"), "{err}");
+        // A different project on the same host is fine.
+        let _other = acquire_run_lock_in(&dir, "h", "proj2").unwrap();
+        drop(a);
+        let _b = acquire_run_lock_in(&dir, "h", "proj").unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_lock_reclaims_stale_pid() {
+        let dir = std::env::temp_dir().join(format!("cr-lock-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A lock file holding a pid that cannot exist -> reclaimed.
+        let p = dir.join("h-proj.lock");
+        std::fs::write(&p, "4194304").unwrap(); // above pid_max on Linux
+        let _lock = acquire_run_lock_in(&dir, "h", "proj").unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

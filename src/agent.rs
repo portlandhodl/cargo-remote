@@ -19,11 +19,27 @@ use crate::rsync;
 use crate::ssh::Ssh;
 
 /// Bump when the wire format changes; the client re-uploads the agent then.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Full version string printed by `__agent --version` and compared on probe.
 pub fn version_string() -> String {
     format!("{}-{}", PROTOCOL_VERSION, env!("CARGO_PKG_VERSION"))
+}
+
+/// A short BLAKE2 hash of *this* binary. `__agent --version` reports it so
+/// a client installing the agent can verify the installed remote file is
+/// exactly the same build, not a planted lookalike that prints the version.
+pub fn self_tag() -> Result<String> {
+    let exe = std::env::current_exe().context("locate own binary")?;
+    let data = std::fs::read(&exe).with_context(|| format!("read {}", exe.display()))?;
+    use blake2::Digest;
+    let digest = blake2::Blake2b512::digest(&data);
+    Ok(digest[..12].iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// What `__agent --version` prints (protocol version + self hash).
+pub fn version_line() -> Result<String> {
+    Ok(format!("{}+{}", version_string(), self_tag()?))
 }
 
 mod tag {
@@ -114,10 +130,107 @@ struct FileHdr {
     /// For FETCHED: false when the file does not exist on the sender.
     #[serde(default)]
     exists: bool,
+    /// Length of the new file — bounds patch() output on delta payloads.
+    #[serde(default)]
+    len: u64,
 }
 
 fn hdr_block_len(h: u32) -> usize {
     if h == 0 { rsync::BLOCK_LEN } else { h as usize }
+}
+
+/// Files at or below this size whose metadata matches are content-verified
+/// anyway (signature challenge): (len, mtime) alone can be forged by a
+/// co-tenant modifying the remote file in place.
+const VERIFY_MAX: u64 = 1 << 20;
+
+/// Resolve `rel` under `root`, rejecting anything that would escape it
+/// (absolute paths, `..`, Windows prefixes). The wire promise is
+/// root-relative paths; this enforces it on the receiving side.
+fn resolve_under(root: &Path, rel: &str) -> Result<PathBuf> {
+    use std::path::Component;
+    let mut out = root.to_path_buf();
+    for comp in Path::new(rel).components() {
+        match comp {
+            Component::Normal(c) => out.push(c),
+            Component::CurDir => {}
+            _ => anyhow::bail!("refusing path outside the sync root: {rel:?}"),
+        }
+    }
+    Ok(out)
+}
+
+/// Basename for a locally-downloaded file from a remote path string:
+/// reject separators, Windows traversal, dotfiles of the traversal kind,
+/// control characters — the name gets joined into a local directory.
+pub(crate) fn checked_basename(rel: &str) -> Result<&str> {
+    let name = basename(rel);
+    anyhow::ensure!(
+        !name.is_empty()
+            && !name.contains('\\')
+            && !name.bytes().any(|b| b < 0x20 || b == 0x7f)
+            && name != "."
+            && name != "..",
+        "refusing remote file name {rel:?}"
+    );
+    Ok(name)
+}
+
+/// Render remote-supplied text safe for a terminal: control bytes and
+/// escape sequences become the replacement character.
+pub(crate) fn display_safe(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if (c.is_control() && c != '\n' && c != '\t') || c == '\u{7f}' {
+                '�'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// Read a file for hashing/serving where no walk metadata is available:
+/// symlink components are refused (O_NOFOLLOW on unix) so a planted link
+/// cannot steer the read outside the tree.
+fn read_no_follow(path: &Path) -> std::io::Result<Vec<u8>> {
+    let mut oo = std::fs::OpenOptions::new();
+    oo.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        oo.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = oo.open(path)?;
+    let mut data = Vec::new();
+    use std::io::Read as _;
+    file.read_to_end(&mut data)?;
+    Ok(data)
+}
+
+/// Read a file being sent, refusing symlinks swapped in after the walk
+/// (O_NOFOLLOW) and verifying it still matches the walked metadata.
+fn read_for_send(root: &Path, m: &FileMeta) -> Result<Vec<u8>> {
+    let path = root.join(&m.path);
+    let mut oo = std::fs::OpenOptions::new();
+    oo.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        oo.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = oo.open(&path).with_context(|| format!("open {}", m.path))?;
+    let md = file.metadata()?;
+    anyhow::ensure!(md.is_file() && md.len() == m.len, "file changed during sync: {}", m.path);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        anyhow::ensure!(md.mtime() == m.mtime, "file changed during sync: {}", m.path);
+    }
+    use std::io::Read as _;
+    let mut data = Vec::with_capacity(m.len as usize);
+    file.read_to_end(&mut data)?;
+    Ok(data)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -143,6 +256,9 @@ struct ErrMsg {
 
 const MAX_FRAME: u32 = 512 * 1024 * 1024;
 
+/// Bound on silence mid-protocol (a completed frame resets it).
+const FRAME_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 fn pack_hdr<T: Serialize>(hdr: &T, data: &[u8]) -> Result<Vec<u8>> {
     let j = serde_json::to_vec(hdr)?;
     let mut out = Vec::with_capacity(4 + j.len() + data.len());
@@ -152,9 +268,13 @@ fn pack_hdr<T: Serialize>(hdr: &T, data: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// JSON headers are tiny; the u32 length comes from the peer.
+const MAX_HDR_JSON: usize = 1 << 20;
+
 fn unpack_hdr<'a, T: serde::de::DeserializeOwned>(payload: &'a [u8]) -> Result<(T, &'a [u8])> {
     anyhow::ensure!(payload.len() >= 4, "short data frame");
     let jlen = u32::from_le_bytes(payload[..4].try_into().expect("4 bytes")) as usize;
+    anyhow::ensure!(jlen <= MAX_HDR_JSON, "data frame header too large: {jlen}");
     anyhow::ensure!(payload.len() >= 4 + jlen, "short data frame header");
     let hdr: T = serde_json::from_slice(&payload[4..4 + jlen])?;
     Ok((hdr, &payload[4 + jlen..]))
@@ -190,37 +310,50 @@ impl ChannelIo {
                     return Ok(Some((tag, payload)));
                 }
             }
-            match self.ch.wait().await {
-                Some(russh::ChannelMsg::Data { data }) => self.buf.extend_from_slice(&data),
-                Some(russh::ChannelMsg::ExtendedData { data, ext: 1 }) => {
+            // A live-but-evasive server may trickle forever; bound the wait.
+            let msg = tokio::time::timeout(FRAME_IDLE_TIMEOUT, self.ch.wait()).await;
+            match msg {
+                Ok(Some(russh::ChannelMsg::Data { data })) => self.buf.extend_from_slice(&data),
+                Ok(Some(russh::ChannelMsg::ExtendedData { data, ext: 1 })) => {
                     self.stderr_tail.extend_from_slice(&data);
                     if self.stderr_tail.len() > 64 * 1024 {
                         let cut = self.stderr_tail.len() - 64 * 1024;
                         self.stderr_tail.drain(..cut);
                     }
                 }
-                Some(russh::ChannelMsg::Close) | None => {
+                Ok(Some(russh::ChannelMsg::Close)) | Ok(None) => {
                     if self.buf.is_empty() {
                         return Ok(None);
                     }
                     bail!(
                         "agent channel closed with {} unprocessed bytes; agent stderr tail: {}",
                         self.buf.len(),
-                        String::from_utf8_lossy(&self.stderr_tail)
+                        display_safe(&String::from_utf8_lossy(&self.stderr_tail))
                     );
                 }
+                Err(_) => bail!("agent idle: no data for {}s", FRAME_IDLE_TIMEOUT.as_secs()),
                 _ => {}
             }
         }
     }
 
     pub async fn write_frame(&mut self, tag: u8, payload: &[u8]) -> Result<()> {
+        anyhow::ensure!(
+            payload.len() <= u32::MAX as usize,
+            "frame payload too large: {}",
+            payload.len()
+        );
         let mut v = Vec::with_capacity(5 + payload.len());
         v.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         v.push(tag);
         v.extend_from_slice(payload);
         self.ch.data_bytes(v).await?;
         Ok(())
+    }
+
+    /// Tail of the agent's stderr, for error messages.
+    pub fn stderr_tail(&self) -> String {
+        String::from_utf8_lossy(&self.stderr_tail).trim().to_string()
     }
 
     pub async fn write_json<T: Serialize>(&mut self, tag: u8, v: &T) -> Result<()> {
@@ -254,6 +387,11 @@ impl StdIo {
 
     async fn write_frame(&mut self, tag: u8, payload: &[u8]) -> Result<()> {
         use tokio::io::AsyncWriteExt;
+        anyhow::ensure!(
+            payload.len() <= u32::MAX as usize,
+            "frame payload too large: {}",
+            payload.len()
+        );
         let mut v = Vec::with_capacity(5 + payload.len());
         v.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         v.push(tag);
@@ -278,6 +416,18 @@ pub fn excluded(rel: &str, excludes: &[String]) -> bool {
     excludes
         .iter()
         .any(|e| rel == e || rel.starts_with(&format!("{e}/")))
+}
+
+/// A signature for `file_len` bytes has ceil(len/block_len) records of 32
+/// bytes; anything larger is a hostile/corrupt peer inflating memory.
+fn check_sig_size(file_len: u64, block_len: usize, sig_bytes: usize) -> Result<()> {
+    let blocks = file_len.div_ceil(block_len.max(1) as u64);
+    let max = (blocks as usize).saturating_mul(32);
+    anyhow::ensure!(
+        sig_bytes <= max,
+        "oversized signature: {sig_bytes} bytes for a {file_len}-byte file (max {max})"
+    );
+    Ok(())
 }
 
 fn entry_mode(md: &std::fs::Metadata, #[allow(unused)] is_dir: bool) -> u32 {
@@ -402,13 +552,18 @@ impl Agent {
     pub async fn start(ssh: &Ssh, agent_path_q: &str) -> Result<Agent> {
         let ch = ssh.open_exec_channel(&format!("{agent_path_q} __agent")).await?;
         let mut io = ChannelIo::new(ch);
-        let (t, payload) = io
-            .read_frame()
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("agent exited before HELLO"))?;
+        let hello = io.read_frame().await?;
+        let (t, payload) = hello.ok_or_else(|| {
+            let tail = display_safe(&io.stderr_tail());
+            if tail.is_empty() {
+                anyhow::anyhow!("agent exited before HELLO")
+            } else {
+                anyhow::anyhow!("agent exited before HELLO; remote stderr: {tail}")
+            }
+        })?;
         if t == tag::ERROR {
             let e: ErrMsg = serde_json::from_slice(&payload)?;
-            bail!("remote agent error: {}", e.message);
+            bail!("remote agent error: {}", display_safe(&e.message));
         }
         anyhow::ensure!(t == tag::HELLO, "agent: expected HELLO, got tag {t}");
         let hello: Hello = serde_json::from_slice(&payload)?;
@@ -464,6 +619,7 @@ impl Agent {
         let mut mkdirs = Vec::new();
         let mut sends: Vec<&FileMeta> = Vec::new();
         let mut sig_wanted: Vec<String> = Vec::new();
+        let mut verify: Vec<&FileMeta> = Vec::new();
         for m in &local {
             match remote_map.get(m.path.as_str()) {
                 None => {
@@ -479,7 +635,13 @@ impl Agent {
                         sig_wanted.push(m.path.clone());
                     }
                 }
-                _ => {}
+                Some(_) => {
+                    // (len, mtime) alone can be forged in place remotely;
+                    // spot-verify small files by content signature.
+                    if m.kind == KIND_FILE && m.len > 0 && m.len <= VERIFY_MAX {
+                        verify.push(m);
+                    }
+                }
             }
         }
         let mut deletes: Vec<&FileMeta> = Vec::new();
@@ -499,6 +661,71 @@ impl Agent {
             });
         }
 
+        // Execute the plan.
+        if !mkdirs.is_empty() {
+            self.io
+                .write_json(tag::MKDIR, &Paths { paths: mkdirs })
+                .await?;
+        }
+        let verify_paths: Vec<String> = verify.iter().map(|m| m.path.clone()).collect();
+        if !sig_wanted.is_empty() || !verify_paths.is_empty() {
+            let mut req = sig_wanted.clone();
+            req.extend(verify_paths.iter().cloned());
+            self.io.write_json(tag::SIG_REQ, &SigReq { paths: req }).await?;
+        }
+
+        // Collect signatures (agent answers with exactly one SIG per path).
+        // The remote reads and checksums each file, so this can take a
+        // while on large trees: report it as its own phase. Each payload is
+        // bound-checked against the remote file's listed length so a
+        // hostile agent cannot inflate memory.
+        let sig_total = sig_wanted.len() + verify_paths.len();
+        let mut sigs: std::collections::HashMap<String, (u32, Vec<rsync::BlockSig>)> =
+            std::collections::HashMap::new();
+        for (i, p) in sig_wanted.iter().enumerate() {
+            progress.status(&format!(
+                "collecting remote signatures: {}/{sig_total}",
+                i + 1,
+            ));
+            let (t, payload) = self.expect(tag::SIG).await?;
+            let _ = t;
+            let (hdr, data): (SigHdr, _) = unpack_hdr(&payload)?;
+            if !data.is_empty() {
+                let listed = remote_map.get(p.as_str()).map(|m| m.len).unwrap_or(0);
+                check_sig_size(listed, hdr_block_len(hdr.block_len), data.len())?;
+                sigs.insert(
+                    hdr.path,
+                    (hdr.block_len, rsync::sig_from_bytes(data)?),
+                );
+            }
+        }
+        // Content-verify the matched-in-metadata small files; a mismatch
+        // means the remote copy was changed without us (resend it fully).
+        for (i, m) in verify.iter().enumerate() {
+            progress.status(&format!(
+                "verifying unchanged files: {}/{sig_total}",
+                sig_wanted.len() + i + 1,
+            ));
+            let (t, payload) = self.expect(tag::SIG).await?;
+            let _ = t;
+            let (hdr, data): (SigHdr, _) = unpack_hdr(&payload)?;
+            anyhow::ensure!(
+                hdr.path == m.path,
+                "agent answered SIG for {:?} instead of {:?}",
+                hdr.path,
+                m.path
+            );
+            let local_data = read_for_send(local_root, m)?;
+            let bl = hdr_block_len(hdr.block_len);
+            check_sig_size(m.len, bl, data.len())?;
+            let mine = rsync::signature(&local_data, bl);
+            let remote_sig = rsync::sig_from_bytes(data)?;
+            if mine != remote_sig {
+                sends.push(m);
+            }
+        }
+        progress.clear_status();
+
         let total_files = sends.iter().filter(|m| m.kind == KIND_FILE).count() as u64;
         let total_bytes: u64 = sends
             .iter()
@@ -506,41 +733,6 @@ impl Agent {
             .map(|m| m.len)
             .sum();
         progress.set_totals(Some(total_bytes), Some(total_files));
-
-        // Execute the plan.
-        if !mkdirs.is_empty() {
-            self.io
-                .write_json(tag::MKDIR, &Paths { paths: mkdirs })
-                .await?;
-        }
-        if !sig_wanted.is_empty() {
-            self.io
-                .write_json(tag::SIG_REQ, &SigReq { paths: sig_wanted.clone() })
-                .await?;
-        }
-
-        // Collect signatures (agent answers with exactly one SIG per path).
-        // The remote reads and checksums each file, so this can take a
-        // while on large trees: report it as its own phase.
-        let mut sigs: std::collections::HashMap<String, (u32, Vec<rsync::BlockSig>)> =
-            std::collections::HashMap::new();
-        for (i, _) in sig_wanted.iter().enumerate() {
-            progress.status(&format!(
-                "collecting remote signatures: {}/{}",
-                i + 1,
-                sig_wanted.len()
-            ));
-            let (t, payload) = self.expect(tag::SIG).await?;
-            let _ = t;
-            let (hdr, data): (SigHdr, _) = unpack_hdr(&payload)?;
-            if !data.is_empty() {
-                sigs.insert(
-                    hdr.path,
-                    (hdr.block_len, rsync::sig_from_bytes(data)?),
-                );
-            }
-        }
-        progress.clear_status();
 
         let mut stats = SyncStats {
             files: 0,
@@ -557,6 +749,7 @@ impl Agent {
                 delta: false,
                 block_len: 0,
                 exists: true,
+                len: m.len,
             };
             if m.kind != KIND_FILE {
                 self.io
@@ -564,8 +757,7 @@ impl Agent {
                     .await?;
                 continue;
             }
-            let data = std::fs::read(local_root.join(&m.path))
-                .with_context(|| format!("read {}", m.path))?;
+            let data = read_for_send(local_root, m)?;
             stats.files += 1;
             stats.full_bytes += data.len() as u64;
             let payload = match sigs.get(&m.path) {
@@ -653,24 +845,35 @@ impl Agent {
         progress.clear_status();
 
         let mut written = Vec::new();
-        for _ in rel_paths {
+        for rel in rel_paths {
             let (_, payload) = self.expect(tag::FETCHED).await?;
             progress.add_wire(payload.len() as u64);
             progress.inc_file();
             let (hdr, data): (FileHdr, _) = unpack_hdr(&payload)?;
+            anyhow::ensure!(
+                hdr.path == *rel,
+                "agent answered fetch for {:?} instead of {rel:?}",
+                hdr.path
+            );
             if !hdr.exists {
-                eprintln!("cargo-remote: {} vanished on remote, skipped", hdr.path);
+                eprintln!(
+                    "cargo-remote: {} vanished on remote, skipped",
+                    display_safe(rel)
+                );
                 continue;
             }
-            let dest = dest_dir.join(basename(&hdr.path));
+            let name = checked_basename(rel)?;
+            let dest = dest_dir.join(name);
             let content = if hdr.delta {
                 let old = std::fs::read(&dest).unwrap_or_default();
-                rsync::patch(&old, data, hdr_block_len(hdr.block_len))?
+                let expected = usize::try_from(hdr.len)
+                    .map_err(|_| anyhow::anyhow!("file too large for this platform"))?;
+                rsync::patch(&old, data, hdr_block_len(hdr.block_len), expected)?
             } else {
                 data.to_vec()
             };
             write_file_atomic(&dest, &content, hdr.mode, hdr.mtime)?;
-            written.push(basename(&hdr.path).to_string());
+            written.push(name.to_string());
         }
         let (_, payload) = self.expect(tag::DONE).await?;
         let _: Done = serde_json::from_slice(&payload)?;
@@ -685,7 +888,7 @@ impl Agent {
             .ok_or_else(|| anyhow::anyhow!("agent closed connection unexpectedly"))?;
         if t == tag::ERROR {
             let e: ErrMsg = serde_json::from_slice(&payload)?;
-            bail!("remote agent error: {}", e.message);
+            bail!("remote agent error: {}", display_safe(&e.message));
         }
         anyhow::ensure!(t == want, "agent: expected tag {want}, got {t}");
         Ok((t, payload))
@@ -739,21 +942,60 @@ pub async fn serve() -> Result<()> {
     }
 }
 
-/// Write `content` to `dest` atomically, then apply mode and mtime.
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Unguessable staging path next to `dest`: a pre-planted symlink under a
+/// predictable name is the classic attack, so the name carries pid, a
+/// counter, and time — and creation uses O_EXCL.
+fn tmp_path_for(dest: &Path) -> PathBuf {
+    let name = dest
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "x".into());
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    dest.with_file_name(format!(
+        ".{name}.tmp-{}-{seq}-{:x}",
+        std::process::id(),
+        nanos
+    ))
+}
+
+/// Write `content` to `dest` atomically, then apply mode (masked to 0777)
+/// and mtime (clamped to the past). The temp file is created with O_EXCL
+/// and cleaned up on failure.
 fn write_file_atomic(dest: &Path, content: &[u8], mode: u32, mtime: i64) -> Result<()> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = dest.with_extension("cargo-remote-part");
-    std::fs::write(&tmp, content)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
+    let tmp = tmp_path_for(dest);
+    let res = (|| -> Result<()> {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .with_context(|| format!("create {}", tmp.display()))?;
+        f.write_all(content)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(mode & 0o777))?;
+        }
+        let now = filetime::FileTime::now();
+        let clamped = mtime.clamp(0, now.unix_seconds());
+        filetime::set_file_handle_times(&f, None, Some(filetime::FileTime::from_unix_time(clamped, 0)))?;
+        drop(f);
+        std::fs::rename(&tmp, dest)?;
+        Ok(())
+    })();
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    filetime::set_file_mtime(&tmp, filetime::FileTime::from_unix_time(mtime, 0))?;
-    std::fs::rename(&tmp, dest)?;
-    Ok(())
+    res
 }
 
 async fn serve_sync(io: &mut StdIo, req: SyncReq) -> Result<()> {
@@ -771,13 +1013,13 @@ async fn serve_sync(io: &mut StdIo, req: SyncReq) -> Result<()> {
             tag::MKDIR => {
                 let p: Paths = serde_json::from_slice(&payload)?;
                 for d in &p.paths {
-                    std::fs::create_dir_all(root.join(d))?;
+                    std::fs::create_dir_all(resolve_under(&root, d)?)?;
                 }
             }
             tag::DELETE => {
                 let p: Paths = serde_json::from_slice(&payload)?;
                 for d in &p.paths {
-                    let path = root.join(d);
+                    let path = resolve_under(&root, d)?;
                     let md = std::fs::symlink_metadata(&path);
                     match md {
                         Ok(m) if m.is_dir() => {
@@ -793,8 +1035,8 @@ async fn serve_sync(io: &mut StdIo, req: SyncReq) -> Result<()> {
             tag::SIG_REQ => {
                 let r: SigReq = serde_json::from_slice(&payload)?;
                 for rel in &r.paths {
-                    let path = root.join(rel);
-                    let (sig, bl) = match std::fs::read(&path) {
+                    let path = resolve_under(&root, rel)?;
+                    let (sig, bl) = match read_no_follow(&path) {
                         Ok(data) if !data.is_empty() => {
                             let bl = rsync::block_len_for(data.len() as u64);
                             (rsync::sig_to_bytes(&rsync::signature(&data, bl)), bl)
@@ -825,13 +1067,24 @@ async fn serve_sync(io: &mut StdIo, req: SyncReq) -> Result<()> {
 }
 
 fn apply_put(root: &Path, hdr: &FileHdr, data: &[u8]) -> Result<()> {
-    let dest = root.join(&hdr.path);
+    let dest = resolve_under(root, &hdr.path)?;
     match hdr.kind {
         KIND_DIR => {
             std::fs::create_dir_all(&dest)?;
         }
         KIND_LINK => {
             let target = hdr.link.clone().unwrap_or_default();
+            // Symlink targets obey the same confinement rule as paths:
+            // relative, no `..`, no absolute components.
+            {
+                use std::path::Component;
+                for comp in Path::new(&target).components() {
+                    anyhow::ensure!(
+                        matches!(comp, Component::Normal(_) | Component::CurDir),
+                        "symlink target {target:?} escapes the sync root"
+                    );
+                }
+            }
             let _ = std::fs::remove_file(&dest);
             #[cfg(unix)]
             std::os::unix::fs::symlink(&target, &dest)?;
@@ -841,7 +1094,9 @@ fn apply_put(root: &Path, hdr: &FileHdr, data: &[u8]) -> Result<()> {
         _ => {
             let content = if hdr.delta {
                 let old = std::fs::read(&dest).unwrap_or_default();
-                rsync::patch(&old, data, hdr_block_len(hdr.block_len))?
+                let expected = usize::try_from(hdr.len)
+                    .map_err(|_| anyhow::anyhow!("file too large for this platform"))?;
+                rsync::patch(&old, data, hdr_block_len(hdr.block_len), expected)?
             } else {
                 data.to_vec()
             };
@@ -871,8 +1126,8 @@ async fn serve_fetch(io: &mut StdIo, req: FetchReq) -> Result<()> {
     let mut files = 0u64;
     let mut bytes = 0u64;
     for rel in &req.paths {
-        let path = root.join(rel);
-        match std::fs::read(&path) {
+        let path = resolve_under(&root, rel)?;
+        match read_no_follow(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let hdr = FileHdr {
                     path: rel.clone(),
@@ -883,7 +1138,7 @@ async fn serve_fetch(io: &mut StdIo, req: FetchReq) -> Result<()> {
             }
             Err(e) => return Err(e.into()),
             Ok(data) => {
-                let md = std::fs::metadata(&path)?;
+                let md = std::fs::symlink_metadata(&path)?;
                 let mtime = md
                     .modified()
                     .ok()
@@ -899,6 +1154,7 @@ async fn serve_fetch(io: &mut StdIo, req: FetchReq) -> Result<()> {
                     delta: false,
                     block_len: 0,
                     exists: true,
+                    len: data.len() as u64,
                 };
                 let payload = match sigs.get(rel) {
                     Some((bl, sig)) => {
@@ -991,6 +1247,7 @@ mod tests {
             delta: true,
             block_len: 4096,
             exists: true,
+            len: 13,
         };
         let payload = pack_hdr(&hdr, b"payload-bytes").unwrap();
         let (got, data): (FileHdr, _) = unpack_hdr(&payload).unwrap();
@@ -1000,11 +1257,207 @@ mod tests {
     }
 
     #[test]
+    fn sig_size_bound() {
+        // 1 MiB file & 32 KiB blocks -> 32 blocks -> 1024 sig bytes max.
+        assert!(check_sig_size(1 << 20, 32 * 1024, 1024).is_ok());
+        assert!(check_sig_size(1 << 20, 32 * 1024, 1025).is_err());
+        assert!(check_sig_size(0, 32 * 1024, 1).is_err());
+        // A 1 TiB file with 64 KiB blocks has 2^24 blocks -> 2^29 sig bytes.
+        assert!(check_sig_size(1 << 40, 64 * 1024, 1 << 29).is_ok());
+        assert!(check_sig_size(1 << 40, 64 * 1024, (1 << 29) + 1).is_err());
+    }
+
+    #[test]
     fn same_entry_compare() {
         let a = meta("f", 10, 100, KIND_FILE);
         assert!(same_entry(&a, &meta("f", 10, 100, KIND_FILE)));
         assert!(!same_entry(&a, &meta("f", 11, 100, KIND_FILE)));
         assert!(!same_entry(&a, &meta("f", 10, 101, KIND_FILE)));
         assert!(!same_entry(&a, &meta("f", 10, 100, KIND_DIR)));
+    }
+
+    // ---- Phase-2 hardening ---------------------------------------------
+
+    #[test]
+    fn resolve_under_accepts_normal_paths() {
+        let root = Path::new("/root");
+        assert_eq!(resolve_under(root, "a/b/c.rs").unwrap(), root.join("a/b/c.rs"));
+        assert_eq!(resolve_under(root, "a/./b").unwrap(), root.join("a/b"));
+        assert_eq!(resolve_under(root, "x").unwrap(), root.join("x"));
+    }
+
+    #[test]
+    fn resolve_under_rejects_escapes() {
+        let root = Path::new("/root");
+        for bad in [
+            "..",
+            "../x",
+            "a/../../b",
+            "/etc/passwd",
+            "a/../../../etc/passwd",
+            "/",
+            "//host/share",
+        ] {
+            assert!(resolve_under(root, bad).is_err(), "{bad:?}");
+        }
+        // Backslash is a separator on Windows only; either way it must stay
+        // confined to the root.
+        #[cfg(windows)]
+        assert!(resolve_under(root, "..\\..\\win").is_err());
+        #[cfg(unix)]
+        assert!(resolve_under(root, "..\\..\\win").unwrap().starts_with(root));
+    }
+
+    #[test]
+    fn checked_basename_rules() {
+        assert_eq!(checked_basename("target/release/app").unwrap(), "app");
+        assert_eq!(checked_basename("a.so").unwrap(), "a.so");
+        for bad in [
+            "..\\..\\x\\evil.exe",
+            "..",
+            ".",
+            "a/b/..",
+            "x/\n",
+            "target/\u{0}d",
+            "",
+        ] {
+            assert!(checked_basename(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn display_safe_strips_controls() {
+        assert_eq!(display_safe("ok text"), "ok text");
+        assert_eq!(display_safe("a\nb\tc"), "a\nb\tc");
+        let s = display_safe("\u{1b}[2J\u{1b}]52;c;AAA\u{7}\u{7f}hi\r\n");
+        assert!(!s.contains('\u{1b}'));
+        assert!(!s.contains('\u{7}'));
+        assert!(!s.contains('\r'));
+        assert!(s.contains("hi"));
+    }
+
+    #[test]
+    fn write_file_atomic_uses_random_tmp_and_masks_mode() {
+        let dir = std::env::temp_dir().join(format!("cr-wfa-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("out.bin");
+
+        write_file_atomic(&dest, b"hello", 0o6755, i64::MAX).unwrap();
+        let md = std::fs::metadata(&dest).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // setuid/setgid/sticky masked off
+            assert_eq!(md.permissions().mode() & 0o7777, 0o755);
+            // future mtime clamped to <= now
+            use std::os::unix::fs::MetadataExt;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+            assert!(md.mtime() <= now, "mtime {} not clamped", md.mtime());
+        }
+        assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
+        // No stale staging files left.
+        let staged: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .filter(|n| n.to_string_lossy().contains(".tmp-"))
+            .collect();
+        assert!(staged.is_empty(), "stale tmp files: {staged:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_file_atomic_tmp_names_are_unique() {
+        let a = tmp_path_for(Path::new("/d/f"));
+        let b = tmp_path_for(Path::new("/d/f"));
+        assert_ne!(a, b);
+        assert!(a != Path::new("/d/f").with_extension("cargo-remote-part"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_for_send_refuses_swapped_symlink() {
+        let dir = std::env::temp_dir().join(format!("cr-toctou-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("f");
+        std::fs::write(&real, b"content").unwrap();
+        let md = std::fs::metadata(&real).unwrap();
+        let m = FileMeta {
+            path: "f".into(),
+            len: 7,
+            mtime: md
+                .modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64,
+            mode: 0o644,
+            kind: KIND_FILE,
+            link: None,
+        };
+        // Unchanged: read succeeds.
+        assert_eq!(read_for_send(&dir, &m).unwrap(), b"content");
+        // Swapped for a symlink pointing outside the tree: refused.
+        std::fs::remove_file(&real).unwrap();
+        let outside = dir.join(".$$outside$$");
+        std::fs::write(&outside, b"secret").unwrap();
+        std::os::unix::fs::symlink(&outside, &real).unwrap();
+        assert!(read_for_send(&dir, &m).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_put_confines_paths() {
+        let dir = std::env::temp_dir().join(format!("cr-put-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        for bad in ["../../evil", "/tmp/evil-abs", "a/../../evil"] {
+            let hdr = FileHdr {
+                path: bad.into(),
+                mode: 0o644,
+                mtime: 0,
+                kind: KIND_FILE,
+                link: None,
+                delta: false,
+                block_len: 0,
+                exists: true,
+                len: 3,
+            };
+            assert!(apply_put(&root, &hdr, b"abc").is_err(), "{bad}");
+        }
+        // A symlink pointing outside the root is refused.
+        let hdr = FileHdr {
+            path: "link".into(),
+            mode: 0o777,
+            mtime: 0,
+            kind: KIND_LINK,
+            link: Some("../../etc/passwd".into()),
+            delta: false,
+            block_len: 0,
+            exists: true,
+            len: 0,
+        };
+        assert!(apply_put(&root, &hdr, &[]).is_err());
+        let hdr = FileHdr {
+            path: "link2".into(),
+            mode: 0o777,
+            mtime: 0,
+            kind: KIND_LINK,
+            link: Some("/etc/passwd".into()),
+            delta: false,
+            block_len: 0,
+            exists: true,
+            len: 0,
+        };
+        assert!(apply_put(&root, &hdr, &[]).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

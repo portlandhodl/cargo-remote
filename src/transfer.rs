@@ -85,6 +85,16 @@ impl Transfer {
                     && let Some(dir) = snar.parent()
                 {
                     std::fs::create_dir_all(dir)?;
+                    // The snapshot leaks the project's file list; keep the
+                    // cache dir private on multi-user machines.
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+                        if let Some(base) = dir.parent() {
+                            let _ = std::fs::set_permissions(base, std::fs::Permissions::from_mode(0o700));
+                        }
+                    }
                 }
                 tar_sync(ctx, Compressor::None, Some(&snar)).await
             }

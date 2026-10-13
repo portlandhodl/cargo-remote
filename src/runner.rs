@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
 
-use crate::agent::{Agent, PROTOCOL_VERSION, version_string};
+use crate::agent::{Agent, PROTOCOL_VERSION, checked_basename, display_safe, version_line};
 use crate::progress::Progress;
 use crate::project::{CargoSubcommand, Project, profile_from_args};
 use crate::ssh::Ssh;
@@ -62,6 +62,9 @@ pub struct Context {
     pub ssh: Option<Ssh>,
     /// Configured remote constraints; filled in from the config file.
     pub requirements: Requirements,
+    /// Kept so the run lock lives until the Context is dropped.
+    #[doc(hidden)]
+    pub _run_lock: Option<crate::RunLock>,
     agent: tokio::sync::OnceCell<Option<String>>,
 }
 
@@ -85,6 +88,7 @@ impl Context {
             cargo_path,
             ssh,
             requirements: Requirements::default(),
+            _run_lock: None,
             agent: tokio::sync::OnceCell::new(),
         }
     }
@@ -278,7 +282,10 @@ impl Context {
             let (_, out) = ssh.exec_capture(&format!("{cargo} --version")).await?;
             let text = String::from_utf8_lossy(&out);
             let got = parse_version(&text).with_context(|| {
-                format!("could not parse remote toolchain version from '{}'", text.trim())
+                format!(
+                    "could not parse remote toolchain version from '{}'",
+                    display_safe(text.trim())
+                )
             })?;
             let want = parse_version(min)
                 .with_context(|| format!("invalid min_rust_version '{min}' in config"))?;
@@ -358,7 +365,7 @@ impl Context {
         let mut agent_ok = false;
         let (code, out) = ssh.exec_capture("uname -sm").await?;
         if code == 0 {
-            let uname = String::from_utf8_lossy(&out);
+            let uname = display_safe(&String::from_utf8_lossy(&out));
             let mut parts = uname.split_whitespace();
             let os = parts.next().unwrap_or("").to_string();
             let arch = norm_arch(parts.next().unwrap_or(""));
@@ -387,7 +394,7 @@ impl Context {
         let cargo = self.cargo_program();
         let (code, out) = ssh.exec_capture(&format!("{cargo} --version")).await?;
         if code == 0 {
-            let text = String::from_utf8_lossy(&out).trim().to_string();
+            let text = display_safe(String::from_utf8_lossy(&out).trim());
             match parse_version(&text) {
                 Ok(v) => {
                     let min = self
@@ -466,13 +473,13 @@ impl Context {
         if agent_ok {
             let dir = format!("{}/.cargo-remote", self.remote_base.trim_end_matches('/'));
             let path_q = format!("{}/agent", self.quote_remote(&dir));
-            let want = version_string();
+            let want = version_line()?;
             let (_, out) = ssh
                 .exec_capture(&format!(
                     "test -x {path_q} && {path_q} __agent --version 2>/dev/null || true"
                 ))
                 .await?;
-            let got = String::from_utf8_lossy(&out).trim().to_string();
+            let got = display_safe(String::from_utf8_lossy(&out).trim());
             if got == want {
                 eprintln!("  agent:     ok (installed, {got})");
             } else if got.is_empty() {
@@ -521,7 +528,7 @@ impl Context {
 
         // The agent is a copy of our own binary: platform must match.
         let (_, out) = ssh.exec_capture("uname -sm").await?;
-        let uname = String::from_utf8_lossy(&out);
+        let uname = display_safe(&String::from_utf8_lossy(&out));
         let mut parts = uname.split_whitespace();
         let (os, arch) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
         let local_os = match std::env::consts::OS {
@@ -543,7 +550,7 @@ impl Context {
         let dir = format!("{}/.cargo-remote", self.remote_base.trim_end_matches('/'));
         let dir_q = self.quote_remote(&dir);
         let path_q = format!("{dir_q}/agent");
-        let want = version_string();
+        let want = version_line()?;
 
         let (_, out) = ssh
             .exec_capture(&format!(
@@ -563,8 +570,16 @@ impl Context {
             self.host,
             human(total)
         );
-        let tmp_q = format!("{path_q}.tmp.{}", std::process::id());
-        let cmd = format!("mkdir -p {dir_q} && cat > {tmp_q} && chmod 755 {tmp_q} && mv -f {tmp_q} {path_q}");
+        // Unguessable staging name; the directory is pinned to 0700 so a
+        // co-tenant cannot swap or snoop the installed agent.
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp_q = format!("{path_q}.tmp.{}-{nonce:x}", std::process::id());
+        let cmd = format!(
+            "mkdir -p {dir_q} && chmod 700 {dir_q} && cat > {tmp_q} && chmod 755 {tmp_q} && mv -f {tmp_q} {path_q}"
+        );
         let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(8);
         let mut progress = Progress::new("agent", &self.runner);
         progress.set_totals(Some(total), None);
@@ -618,7 +633,7 @@ impl Context {
         let find_cmd = format!(
             "cd {} && find target/{} -maxdepth 1 -type f \
              \\( -perm -u+x -o -name '*.so' -o -name '*.dylib' -o -name '*.dll' \\) \
-             -print 2>/dev/null",
+             -print0 2>/dev/null",
             self.remote_dir_q(),
             profile
         );
@@ -626,11 +641,12 @@ impl Context {
         if code != 0 {
             bail!("remote find failed with exit code {code}");
         }
-        let files: Vec<String> = String::from_utf8_lossy(&out)
-            .lines()
-            .map(|l| l.trim())
-            .filter(|l| !l.is_empty())
-            .map(|l| l.to_string())
+        // NUL-terminated: a filename containing a newline must not split
+        // into phantom entries.
+        let files: Vec<String> = out
+            .split(|b| *b == 0)
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .filter(|s| !s.trim().is_empty())
             .collect();
 
         let dest = self.project.local_profile_dir(&profile);
@@ -651,16 +667,16 @@ impl Context {
                 // Fallback: plain full-file downloads.
                 let mut got = Vec::new();
                 for f in &files {
-                    let name = f.rsplit('/').next().unwrap_or(f).to_string();
+                    let name = checked_basename(f)?;
                     let src = format!("{}/{}", self.remote_dir(), f);
-                    ssh.exec_download(&format!("cat {}", self.quote_remote(&src)), &dest.join(&name))
+                    ssh.exec_download(&format!("cat {}", self.quote_remote(&src)), &dest.join(name))
                         .await?;
-                    let size = std::fs::metadata(dest.join(&name))
+                    let size = std::fs::metadata(dest.join(name))
                         .map(|m| m.len())
                         .unwrap_or(0);
                     progress.add_wire(size);
                     progress.inc_file();
-                    got.push(name);
+                    got.push(name.to_string());
                 }
                 got
             };
@@ -668,7 +684,7 @@ impl Context {
             progress.finish(&format!("{} files, {} received", names.len(), human(received)));
             if self.runner.verbose {
                 for n in &names {
-                    eprintln!("copied back: {}", dest.join(n).display());
+                    eprintln!("copied back: {}", dest.join(display_safe(n)).display());
                 }
             }
         }

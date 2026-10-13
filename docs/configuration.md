@@ -160,6 +160,16 @@ and disk — against the live host (see
 
 ## Notes
 
+- Runs are serialized per project+host with a lock in
+  `~/.cache/cargo-remote/locks` (a stale lock from a crashed process is
+  reclaimed automatically on unix).
+- The sync agent is verified by a hash of the binary (not just a version
+  string) on every run; a mismatch re-uploads it. The agent directory on the
+  remote is kept at mode 0700.
+- Delta sync double-checks small files by content signature, so a file
+  modified on the server with preserved size/mtime is still resynced.
+  Downloaded artifacts are written with unguessable temp names and
+  masked/validated permissions.
 - Status lines show `env` values as `KEY=***` (they are usually secrets);
   `-v/--verbose` reveals them.
 - After a build, if the remote `Cargo.lock` differs from local, the remote

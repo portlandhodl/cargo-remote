@@ -14,7 +14,27 @@ impl Project {
     /// Find the workspace root containing `dir` (via `cargo locate-project`,
     /// falling back to walking up the directory tree).
     pub fn discover(dir: PathBuf) -> anyhow::Result<Project> {
-        let root = locate_workspace(&dir)
+        let located = locate_workspace(&dir);
+        if located.is_none()
+            && let Some(w) = walk_up(&dir)
+        {
+            // Fallback without cargo's confirmation: the crowned root may be
+            // a parent dir that merely happens to contain a Cargo.toml.
+            eprintln!(
+                "cargo-remote: warning: cargo locate-project failed; using {} \
+                 found by scanning upwards — verify this is your workspace root",
+                w.display()
+            );
+            return Ok(Project {
+                name: remote_safe_name(&w
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "project".to_string())),
+                root: w,
+            });
+        }
+        let root = located
             .or_else(|| walk_up(&dir))
             .ok_or_else(|| {
                 anyhow::anyhow!(

@@ -36,6 +36,15 @@ pub struct ConnInfo {
 /// Channel type used for exec/agent sessions.
 pub type ClientChannel = Channel<client::Msg>;
 
+/// Bound on connect/handshake and channel setup.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bound on silence inside an exec_capture (metadata commands only).
+const CAPTURE_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+/// exec_capture output ceiling (Cargo.lock, find listings, probe output).
+const MAX_CAPTURE: usize = 64 * 1024 * 1024;
+/// exec_download size ceiling (copied-back binaries).
+const MAX_DOWNLOAD: u64 = 4 * 1024 * 1024 * 1024;
+
 /// What check_server_key decided, for error reporting after connect fails.
 type Rejection = Arc<Mutex<Option<String>>>;
 
@@ -173,26 +182,37 @@ impl Ssh {
         let config = Arc::new(client::Config {
             nodelay: true,
             keepalive_interval: Some(Duration::from_secs(15)),
-            inactivity_timeout: None,
+            // A peer that stops talking entirely stalls forever otherwise.
+            inactivity_timeout: Some(Duration::from_secs(600)),
             ..Default::default()
         });
 
-        let mut handle = if cfg.host_config.proxy_command.is_some() {
-            let stream = cfg
-                .stream()
-                .await
-                .map_err(|e| anyhow!("{alias}: proxy connect failed: {e}"))?;
-            client::connect_stream(config, stream, handler).await
-        } else {
-            client::connect(config, (hostname.as_str(), port), handler).await
-        }
-        .map_err(|e| {
-            if let Some(reason) = rejection.lock().unwrap().take() {
-                anyhow!("{reason}")
+        // Bound the connect+handshake so a stalling peer fails fast.
+        let connect_fut = async {
+            if cfg.host_config.proxy_command.is_some() {
+                let stream = cfg
+                    .stream()
+                    .await
+                    .map_err(|e| anyhow!("{alias}: proxy connect failed: {e}"))?;
+                client::connect_stream(config, stream, handler)
+                    .await
+                    .map_err(anyhow::Error::from)
             } else {
-                anyhow!("{alias}: SSH connect to {hostname}:{port} failed: {e}")
+                client::connect(config, (hostname.as_str(), port), handler)
+                    .await
+                    .map_err(anyhow::Error::from)
             }
-        })?;
+        };
+        let mut handle = match tokio::time::timeout(CONNECT_TIMEOUT, connect_fut).await {
+            Err(_) => bail!("{alias}: SSH connect to {hostname}:{port} timed out"),
+            Ok(res) => res.map_err(|e| {
+                if let Some(reason) = rejection.lock().unwrap().take() {
+                    anyhow!("{reason}")
+                } else {
+                    anyhow!("{alias}: SSH connect to {hostname}:{port} failed: {e:#}")
+                }
+            })?,
+        };
 
         authenticate(&mut handle, alias, &user, &cfg).await?;
 
@@ -213,12 +233,15 @@ impl Ssh {
 
     /// Open a session channel running `cmd` (no pty).
     pub async fn open_exec_channel(&self, cmd: &str) -> Result<ClientChannel> {
-        let ch = self
-            .handle
-            .channel_open_session()
+        let open = self.handle.channel_open_session();
+        let ch = tokio::time::timeout(CONNECT_TIMEOUT, open)
             .await
+            .map_err(|_| anyhow!("channel open timed out"))?
             .context("open channel")?;
-        ch.exec(true, cmd).await.context("exec remote command")?;
+        tokio::time::timeout(CONNECT_TIMEOUT, ch.exec(true, cmd))
+            .await
+            .map_err(|_| anyhow!("remote exec request timed out"))?
+            .context("exec remote command")?;
         Ok(ch)
     }
 
@@ -304,21 +327,31 @@ impl Ssh {
     }
 
     /// Run `cmd`, capturing stdout; remote stderr goes to our stderr.
+    /// Captured output is capped (metadata commands only) and a silent
+    /// server aborts the wait.
     pub async fn exec_capture(&self, cmd: &str) -> Result<(u32, Vec<u8>)> {
         let mut ch = self.open_exec_channel(cmd).await?;
         ch.eof().await?;
         let mut stdout = Vec::new();
         let mut err = tokio::io::stderr();
         let mut code = None;
-        while let Some(msg) = ch.wait().await {
+        loop {
+            let msg = tokio::time::timeout(CAPTURE_IDLE_TIMEOUT, ch.wait()).await;
             match msg {
-                ChannelMsg::Data { data } => stdout.extend_from_slice(&data),
-                ChannelMsg::ExtendedData { data, ext: 1 } => {
+                Ok(Some(ChannelMsg::Data { data })) => {
+                    stdout.extend_from_slice(&data);
+                    if stdout.len() > MAX_CAPTURE {
+                        bail!("remote output exceeded {} byte capture cap", MAX_CAPTURE);
+                    }
+                }
+                Ok(Some(ChannelMsg::ExtendedData { data, ext: 1 })) => {
                     err.write_all(&data).await?;
                     err.flush().await?;
                 }
-                ChannelMsg::ExitStatus { exit_status } => code = Some(exit_status),
-                ChannelMsg::Close => break,
+                Ok(Some(ChannelMsg::ExitStatus { exit_status })) => code = Some(exit_status),
+                Ok(Some(ChannelMsg::Close)) => break,
+                Ok(None) => break,
+                Err(_) => bail!("remote idle: no data for {}s", CAPTURE_IDLE_TIMEOUT.as_secs()),
                 _ => {}
             }
         }
@@ -357,31 +390,64 @@ impl Ssh {
     }
 
     /// Run `cmd` and stream its stdout into the local file `dest`
-    /// (atomically, via a temp file).
+    /// (atomically, via an unguessable temp file, with a size ceiling).
     pub async fn exec_download(&self, cmd: &str, dest: &std::path::Path) -> Result<()> {
         let mut ch = self.open_exec_channel(cmd).await?;
         ch.eof().await?;
-        let tmp = dest.with_extension("cargo-remote-part");
-        let mut file = tokio::fs::File::create(&tmp)
-            .await
-            .with_context(|| format!("create {}", tmp.display()))?;
-        let mut code = None;
-        while let Some(msg) = ch.wait().await {
-            match msg {
-                ChannelMsg::Data { data } => file.write_all(&data).await?,
-                ChannelMsg::ExitStatus { exit_status } => code = Some(exit_status),
-                ChannelMsg::Close => break,
-                _ => {}
+        let tmp = dest.with_file_name(format!(
+            ".{}.dl-{}-{:x}",
+            dest.file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let result: Result<()> = async {
+            let mut file = tokio::fs::File::create(&tmp)
+                .await
+                .with_context(|| format!("create {}", tmp.display()))?;
+            let mut code = None;
+            let mut total = 0u64;
+            loop {
+                let msg = tokio::time::timeout(CAPTURE_IDLE_TIMEOUT, ch.wait()).await;
+                match msg {
+                    Ok(Some(ChannelMsg::Data { data })) => {
+                        total += data.len() as u64;
+                        if total > MAX_DOWNLOAD {
+                            bail!("download exceeded {MAX_DOWNLOAD} bytes");
+                        }
+                        file.write_all(&data).await?;
+                    }
+                    Ok(Some(ChannelMsg::ExitStatus { exit_status })) => code = Some(exit_status),
+                    Ok(Some(ChannelMsg::Close)) => break,
+                    Ok(None) => break,
+                    Err(_) => bail!("remote idle: no data for {}s", CAPTURE_IDLE_TIMEOUT.as_secs()),
+                    _ => {}
+                }
             }
+            file.flush().await?;
+            drop(file);
+            if code != Some(0) {
+                bail!("remote command failed with code {}", code.unwrap_or(255));
+            }
+            // Only binary artifacts arrive here: make the result runnable,
+            // never world-writable.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+            }
+            std::fs::rename(&tmp, dest)?;
+            Ok(())
         }
-        file.flush().await?;
-        drop(file);
-        if code != Some(0) {
+        .await;
+        if result.is_err() {
             let _ = std::fs::remove_file(&tmp);
-            bail!("remote command failed with code {}", code.unwrap_or(255));
         }
-        std::fs::rename(&tmp, dest)?;
-        Ok(())
+        result
     }
 
 }

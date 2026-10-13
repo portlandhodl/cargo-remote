@@ -166,10 +166,26 @@ fn take<'a>(delta: &'a [u8], p: &mut usize, n: usize) -> anyhow::Result<&'a [u8]
 }
 
 /// Apply `delta` to `old`, producing the new file content.
-pub fn patch(old: &[u8], delta: &[u8], block_len: usize) -> anyhow::Result<Vec<u8>> {
-    let mut out = Vec::new();
+///
+/// `block_len` must be the same value the signature was made with (the
+/// sender picks it via [`block_len_for`]); it is re-validated. The delta is
+/// remote input: every op is bounds-checked, and total output may not exceed
+/// `expected_len` (the sender-provided new-file length), so a hostile delta
+/// cannot expand to arbitrary size.
+pub fn patch(
+    old: &[u8],
+    delta: &[u8],
+    block_len: usize,
+    expected_len: usize,
+) -> anyhow::Result<Vec<u8>> {
+    anyhow::ensure!(
+        block_len > 0 && block_len <= block_len_for(u64::MAX),
+        "delta block_len out of range: {block_len}"
+    );
+    let mut out = Vec::with_capacity(expected_len.min(1 << 24));
     let mut p = 0usize;
     while p < delta.len() {
+        let grow_by;
         match take(delta, &mut p, 1)?[0] {
             OP_COPY => {
                 let ix = u32::from_le_bytes(take(delta, &mut p, 4)?.try_into().expect("4 bytes"))
@@ -178,17 +194,33 @@ pub fn patch(old: &[u8], delta: &[u8], block_len: usize) -> anyhow::Result<Vec<u
                     .checked_mul(block_len)
                     .ok_or_else(|| anyhow::anyhow!("delta copy offset overflow"))?;
                 anyhow::ensure!(start < old.len(), "delta copy out of range");
-                let end = (start + block_len).min(old.len());
+                let end = start.checked_add(block_len).map_or(old.len(), |e| e.min(old.len()));
+                grow_by = end - start;
+                anyhow::ensure!(
+                    out.len() + grow_by <= expected_len,
+                    "delta expands past expected file length"
+                );
                 out.extend_from_slice(&old[start..end]);
             }
             OP_LITERAL => {
                 let len = u32::from_le_bytes(take(delta, &mut p, 4)?.try_into().expect("4 bytes"))
                     as usize;
+                grow_by = len;
+                anyhow::ensure!(
+                    out.len() + grow_by <= expected_len,
+                    "delta expands past expected file length"
+                );
                 out.extend_from_slice(take(delta, &mut p, len)?);
             }
             op => anyhow::bail!("unknown delta op {op}"),
         }
+        let _ = grow_by;
     }
+    anyhow::ensure!(
+        out.len() == expected_len,
+        "delta produced {} bytes, expected {expected_len}",
+        out.len()
+    );
     Ok(out)
 }
 
@@ -214,7 +246,7 @@ mod tests {
         let sig2 = sig_from_bytes(&wire).unwrap();
         assert_eq!(sig, sig2);
         let d = delta(new, &sig2, block_len);
-        let got = patch(old, &d, block_len).unwrap();
+        let got = patch(old, &d, block_len, new.len()).unwrap();
         assert_eq!(got, new, "patch(old, delta) != new");
     }
 
@@ -237,7 +269,7 @@ mod tests {
         let d = delta(&new, &sig, bl);
         // with adaptive block size, only the edited block region is literal
         assert!(d.len() < bl + 2048, "delta too big: {}", d.len());
-        assert_eq!(patch(&old, &d, bl).unwrap(), new);
+        assert_eq!(patch(&old, &d, bl, new.len()).unwrap(), new);
     }
 
     #[test]
@@ -267,8 +299,46 @@ mod tests {
 
     #[test]
     fn corrupt_delta_is_an_error() {
-        assert!(patch(b"abc", &[99, 1, 2], BLOCK_LEN).is_err());
-        assert!(patch(b"abc", &[OP_COPY, 5, 0, 0, 0], BLOCK_LEN).is_err());
-        assert!(patch(b"abc", &[OP_LITERAL, 10, 0, 0, 0, 1], BLOCK_LEN).is_err());
+        assert!(patch(b"abc", &[99, 1, 2], BLOCK_LEN, 3).is_err());
+        assert!(patch(b"abc", &[OP_COPY, 5, 0, 0, 0], BLOCK_LEN, 3).is_err());
+        assert!(patch(b"abc", &[OP_LITERAL, 10, 0, 0, 0, 1], BLOCK_LEN, 3).is_err());
+    }
+
+    #[test]
+    fn malicious_block_len_cannot_expand_output() {
+        // The H-3 bomb: OP_COPY against a big basis with an attacker-
+        // controlled (huge) block_len used to append the whole file per op.
+        let old = noise(1 << 20, 9); // 1 MiB basis
+        let mut d = Vec::new();
+        for _ in 0..2000 {
+            d.push(OP_COPY);
+            d.extend_from_slice(&0u32.to_le_bytes());
+        }
+        // Claiming block_len = u32::MAX must not allocate massively;
+        // the result must error (expected_len is small).
+        let r = patch(&old, &d, u32::MAX as usize, 1024);
+        assert!(r.is_err(), "bomb must be refused");
+        // block_len range is also validated.
+        assert!(patch(&old, &d, 0, 1024).is_err());
+        assert!(patch(&old, &d, (1 << 20) + 1, 1024).is_err());
+    }
+
+    #[test]
+    fn output_capped_at_expected_len() {
+        // Even with a valid block_len, a fabricated delta that would grow
+        // past the expected new length is rejected.
+        let old = noise(10_000, 3);
+        let mut d = Vec::new();
+        for _ in 0..4 {
+            d.push(OP_COPY);
+            d.extend_from_slice(&0u32.to_le_bytes());
+        }
+        let bl = block_len_for(old.len() as u64);
+        // With a small expected length, partial growth errors out.
+        assert!(patch(&old, &d, bl, 1024).is_err());
+        // Wrong (too short) declared length also errors.
+        let sig = signature(&old, bl);
+        let real = delta(&old, &sig, bl);
+        assert!(patch(&old, &real, bl, old.len() - 1).is_err());
     }
 }

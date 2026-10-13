@@ -230,7 +230,7 @@ fn hostile_config_cargo_path_rejected() {
         std::fs::create_dir_all(xdg.join("cargo-remote")).unwrap();
         std::fs::write(
             xdg.join("cargo-remote/config.toml"),
-            &format!("host = \"h\"\ncargo_path = \"{value}\"\n"),
+            format!("host = \"h\"\ncargo_path = \"{value}\"\n"),
         )
         .unwrap();
         let out = run_env(&["-n", "probe"], &proj.0, &[("XDG_CONFIG_HOME", xdg.to_str().unwrap())]);
@@ -391,6 +391,23 @@ fn trust_flag_only_in_global() {
     let out = run(&["-n", "sync"], &proj.0);
     assert!(!out.status.success());
     assert!(stderr(&out).contains("no remote host"), "{}", stderr(&out));
+}
+
+// -------------------------------------------------------------------------
+// Agent self-attestation (Phase 2): version line carries the binary's hash
+// -------------------------------------------------------------------------
+
+#[test]
+fn agent_version_line_includes_self_hash() {
+    let out = bin().arg("__agent").arg("--version").output().unwrap();
+    assert!(out.status.success());
+    let line = String::from_utf8(out.stdout).unwrap();
+    let line = line.trim();
+    //  "2-<semver>+<24 hex>" — a version alone never passes the check.
+    let (ver, hash) = line.rsplit_once('+').expect("version line must carry hash");
+    assert!(ver.starts_with("2-"), "{ver}");
+    assert_eq!(hash.len(), 24, "{hash}");
+    assert!(hash.chars().all(|c| c.is_ascii_hexdigit()), "{hash}");
 }
 
 
