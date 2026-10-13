@@ -1,0 +1,10 @@
+[advisories]
+# RUSTSEC-2023-0071 (rsa / "Marvin Attack", CVE-2023-49092): timing
+# sidechannel in RSA private-key *decryption* paths. cargo-remote never
+# decrypts with RSA — the rsa crate is used only for host-key *verification*
+# (a public-key operation) and client-auth *signing* with the user's own key
+# against the user's own server. The advisory's own guidance accepts local,
+# non-network-observable use. No fixed upstream release exists; the entry
+# must be re-evaluated on every russh upgrade (CI runs cargo audit weekly).
+# See SECURITY.md and the audit report's dependency section.
+ignore = ["RUSTSEC-2023-0071"]
