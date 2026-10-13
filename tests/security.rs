@@ -167,14 +167,19 @@ fn hostile_dir_name_backticks_and_semicolons() {
 #[test]
 fn hostile_config_remote_dir_is_quoted() {
     let proj = TempProject::new("cfg-rd");
+    // remote_dir is a remote-control key: from a project file it is
+    // stripped (Phase 1), so the payload also comes via the CLI flag.
     proj.write_config(
         ".cargo-remote.toml",
-        "host = \"h\"\nremote_dir = \"~/b$(touch /tmp/cr-pwn-rd)\"\n",
+        "remote_dir = \"~/b$(touch /tmp/cr-pwn-rd)\"\n",
     );
+    let out = run(&["-r", "h", "-n", "sync"], &proj.0);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stderr(&out).contains("ignoring remote_dir"), "{}", stderr(&out));
     for args in [
-        vec!["-n", "sync"],
-        vec!["-n", "--transfer", "tar", "sync"],
-        vec!["-n", "build"],
+        vec!["-r", "h", "-n", "--remote-dir", "~/b$(touch /tmp/cr-pwn-rd)", "sync"],
+        vec!["-r", "h", "-n", "--remote-dir", "~/b$(touch /tmp/cr-pwn-rd)", "--transfer", "tar", "sync"],
+        vec!["-r", "h", "-n", "--remote-dir", "~/b$(touch /tmp/cr-pwn-rd)", "build"],
     ] {
         let out = run(&args, &proj.0);
         assert!(out.status.success(), "{args:?}: {}", stderr(&out));
@@ -187,9 +192,9 @@ fn hostile_config_env_is_quoted() {
     let proj = TempProject::new("cfg-env");
     proj.write_config(
         ".cargo-remote.toml",
-        "host = \"h\"\nenv = [\"X=v$(touch /tmp/cr-pwn-env)\", \"Y=`touch /tmp/cr-pwn-env2`\", \"Z=a;touch /tmp/cr-pwn-env3\"]\n",
+        "env = [\"X=v$(touch /tmp/cr-pwn-env)\", \"Y=`touch /tmp/cr-pwn-env2`\", \"Z=a;touch /tmp/cr-pwn-env3\"]\n",
     );
-    let out = run(&["-n", "build"], &proj.0);
+    let out = run(&["-r", "h", "-n", "build"], &proj.0);
     assert!(out.status.success(), "{}", stderr(&out));
     assert_all_inert(&out, FRAGS);
     // And the values show up verbatim inside single quotes on the line.
@@ -206,16 +211,32 @@ fn hostile_config_cargo_path_rejected() {
         ("cargo`touch /tmp/cr-pwn-cp`", "backticks"),
         ("cargo | sh", "pipe"),
     ] {
-        proj.write_config(
-            ".cargo-remote.toml",
-            &format!("host = \"h\"\ncargo_path = \"{value}\"\n"),
-        );
-        let out = run(&["-n", "probe"], &proj.0);
-        assert!(!out.status.success(), "{desc} accepted: {}", stderr(&out));
+        // From a project file cargo_path is stripped outright (Phase 1):
+        proj.write_config(".cargo-remote.toml", &format!("cargo_path = \"{value}\"\n"));
+        let out = run(&["-r", "h", "-n", "build"], &proj.0);
         let err = stderr(&out);
-        assert!(err.contains("invalid cargo_path"), "{desc}: {err}");
-        let out = run(&["-n", "build"], &proj.0);
-        assert!(!out.status.success(), "{desc} accepted in build");
+        assert!(
+            err.contains("ignoring cargo_path") || err.contains("invalid cargo_path"),
+            "{desc}: {err}"
+        );
+        // In a trusted (global) config the value must be rejected by the
+        // charset validator.
+        let xdg = std::env::temp_dir().join(format!(
+            "cr-sec-xdg-cp-{}-{:?}",
+            std::process::id(),
+            desc
+        ));
+        let _ = std::fs::remove_dir_all(&xdg);
+        std::fs::create_dir_all(xdg.join("cargo-remote")).unwrap();
+        std::fs::write(
+            xdg.join("cargo-remote/config.toml"),
+            &format!("host = \"h\"\ncargo_path = \"{value}\"\n"),
+        )
+        .unwrap();
+        let out = run_env(&["-n", "probe"], &proj.0, &[("XDG_CONFIG_HOME", xdg.to_str().unwrap())]);
+        let _ = std::fs::remove_dir_all(&xdg);
+        assert!(!out.status.success(), "{desc} accepted: {}", stderr(&out));
+        assert!(stderr(&out).contains("invalid cargo_path"), "{desc}: {}", stderr(&out));
     }
     assert!(!PathBuf::from("/tmp/cr-pwn-cp").exists());
 }
@@ -224,8 +245,8 @@ fn hostile_config_cargo_path_rejected() {
 fn hostile_config_toolchain_rejected() {
     let proj = TempProject::new("cfg-tc");
     for value in ["nightly;id", "nightly$(id)", "nightly`id`", "x|y", "a b"] {
-        proj.write_config(".cargo-remote.toml", &format!("host = \"h\"\ntoolchain = \"{value}\"\n"));
-        let out = run(&["-n", "check"], &proj.0);
+        proj.write_config(".cargo-remote.toml", &format!("toolchain = \"{value}\"\n"));
+        let out = run(&["-r", "h", "-n", "check"], &proj.0);
         assert!(!out.status.success(), "{value} accepted");
         assert!(stderr(&out).contains("invalid toolchain"), "{}", stderr(&out));
     }
@@ -240,8 +261,8 @@ fn malformed_env_entries_rejected() {
         ("env = [\"A-B=x\"]", "dash in key"),
         ("env = [\"=x\"]", "empty key"),
     ] {
-        proj.write_config(".cargo-remote.toml", &format!("host = \"h\"\n{env_line}\n"));
-        let out = run(&["-n", "build"], &proj.0);
+        proj.write_config(".cargo-remote.toml", &format!("{env_line}\n"));
+        let out = run(&["-r", "h", "-n", "build"], &proj.0);
         assert!(!out.status.success(), "{desc} accepted");
         let err = stderr(&out);
         assert!(err.contains("invalid env"), "{desc}: {err}");
@@ -310,17 +331,96 @@ fn rustflags_payload_is_quoted() {
 }
 
 // -------------------------------------------------------------------------
+// Config trust boundary (Phase 1): cloned repos cannot pick the server
+// -------------------------------------------------------------------------
+
+#[test]
+fn hostile_repo_cannot_redirect_host() {
+    let proj = TempProject::new("evil");
+    proj.write_config(
+        ".cargo-remote.toml",
+        "host = \"collector.evil.example\"\nremote_dir = \"/tmp/stash\"\n",
+    );
+    let out = run(&["-n", "build"], &proj.0);
+    assert!(!out.status.success(), "project host accepted");
+    let err = stderr(&out);
+    assert!(err.contains("ignoring host, remote_dir"), "{err}");
+    assert!(err.contains("no remote host"), "{err}");
+    // And nothing ever mentioned connecting to the attacker.
+    assert!(!err.contains("collector.evil.example "), "{err}");
+}
+
+#[test]
+fn repo_cannot_disable_copy_back_silently() {
+    // copy_back is a remote-control key: a project setting must not flip it
+    // (default stays on for a proper CLI/-global host).
+    let proj = TempProject::new("evil2");
+    proj.write_config(".cargo-remote.toml", "copy_back = false\n");
+    let out = run(&["-r", "h", "-n", "build"], &proj.0);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(err.contains("ignoring copy_back"), "{err}");
+    assert!(err.contains("copy-back: fetch"), "{err}");
+}
+
+#[test]
+fn project_env_and_toolchain_still_apply() {
+    // Documented safe keys: building the repo executes its code on the
+    // server anyway, so toolchain/env stay project-settable.
+    let proj = TempProject::new("ok1");
+    proj.write_config(
+        ".cargo-remote.toml",
+        "toolchain = \"nightly\"\nenv = [\"FOO=a b\"]\n",
+    );
+    let out = run(&["-r", "h", "-n", "check"], &proj.0);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(err.contains("FOO='a b'"), "{err}");
+    assert!(err.contains("+nightly"), "{err}");
+    assert!(!err.contains("ignoring"), "{err}");
+}
+
+#[test]
+fn trust_flag_only_in_global() {
+    let proj = TempProject::new("evil3");
+    // Repo claims trust for itself and picks a host: both must be ignored.
+    proj.write_config(
+        ".cargo-remote.toml",
+        "trust_project_config = true\nhost = \"evil.example\"\n",
+    );
+    let out = run(&["-n", "sync"], &proj.0);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("no remote host"), "{}", stderr(&out));
+}
+
+
+// -------------------------------------------------------------------------
 // Legitimate configuration keeps working byte-for-byte
 // -------------------------------------------------------------------------
 
 #[test]
 fn legit_config_line_is_unchanged() {
     let proj = TempProject::new("legit");
+    // Remote-control keys live in the global config (trusted source);
+    // build-shaping keys may come from the project file.
+    let xdg = std::env::temp_dir().join(format!("cr-sec-xdg-legit-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&xdg);
+    std::fs::create_dir_all(xdg.join("cargo-remote")).unwrap();
+    std::fs::write(
+        xdg.join("cargo-remote/config.toml"),
+        "host = \"h\"\nremote_dir = \"~/remote-builds\"\ncargo_path = \"$HOME/.cargo/bin/cargo\"\n",
+    )
+    .unwrap();
     proj.write_config(
         ".cargo-remote.toml",
-        "host = \"h\"\nremote_dir = \"~/remote-builds\"\ncargo_path = \"$HOME/.cargo/bin/cargo\"\ntoolchain = \"nightly\"\nenv = [\"RUST_LOG=debug,x=y\", \"TOKEN=a b\"]\n",
+        "toolchain = \"nightly\"\nenv = [\"RUST_LOG=debug,x=y\", \"TOKEN=a b\"]\n",
     );
-    let out = run(&["-n", "build", "--release"], &proj.0);
+    let out = run_env(
+        &["-n", "build", "--release"],
+        &proj.0,
+        &[("XDG_CONFIG_HOME", xdg.to_str().unwrap())],
+    );
+    let _ = std::fs::remove_dir_all(&xdg);
     assert!(out.status.success(), "{}", stderr(&out));
     let err = stderr(&out);
     let dir_key = format!("cr-sec-legit-{}", std::process::id());

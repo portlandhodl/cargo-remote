@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
 
@@ -46,6 +46,9 @@ pub struct Context {
     pub remote_base: String,
     pub transfer: Transfer,
     pub copy_back: bool,
+    /// Apply the remote Cargo.lock locally after builds (--update-lockfile);
+    /// otherwise a differing lockfile is saved to Cargo.lock.remote.
+    pub update_lockfile: bool,
     pub sync: bool,
     pub exclude_git: bool,
     pub extra_exclude: Vec<String>,
@@ -63,7 +66,7 @@ pub struct Context {
 }
 
 impl Context {
-    pub fn new(runner: Runner, project: Project, host: String, remote_base: String, transfer: Transfer, copy_back: bool, sync: bool, exclude_git: bool, extra_exclude: Vec<String>, env: Vec<String>, rustflags: Option<String>, toolchain: Option<String>, interactive: bool, cargo_path: String, ssh: Option<Ssh>) -> Self {
+    pub fn new(runner: Runner, project: Project, host: String, remote_base: String, transfer: Transfer, copy_back: bool, update_lockfile: bool, sync: bool, exclude_git: bool, extra_exclude: Vec<String>, env: Vec<String>, rustflags: Option<String>, toolchain: Option<String>, interactive: bool, cargo_path: String, ssh: Option<Ssh>) -> Self {
         Context {
             runner,
             project,
@@ -71,6 +74,7 @@ impl Context {
             remote_base,
             transfer,
             copy_back,
+            update_lockfile,
             sync,
             exclude_git,
             extra_exclude,
@@ -319,7 +323,13 @@ impl Context {
         if let Some(rf) = &self.rustflags {
             sent.push(format!("RUSTFLAGS={rf}"));
         }
-        sent.extend(self.env.iter().cloned());
+        sent.extend(self.env.iter().map(|kv| {
+            if self.runner.verbose {
+                kv.clone()
+            } else {
+                mask_env(kv)
+            }
+        }));
         if !sent.is_empty() {
             eprintln!("  env sent:  {}", sent.join(" "));
         }
@@ -599,7 +609,8 @@ impl Context {
         let profile = profile_from_args(args)?;
         if self.runner.dry_run {
             self.runner.show_line(&format!(
-                "copy-back: fetch binaries from target/{profile}, refresh Cargo.lock"
+                "copy-back: fetch binaries from target/{profile}, \
+                 save a differing remote Cargo.lock to Cargo.lock.remote"
             ));
             return Ok(());
         }
@@ -670,17 +681,46 @@ impl Context {
         let ssh = self.require_ssh()?;
         let remote_cmd = format!("cat {}/Cargo.lock 2>/dev/null || true", self.remote_dir_q());
         let (_, out) = ssh.exec_capture(&remote_cmd).await?;
-        if out.is_empty() {
-            return Ok(());
-        }
-        let local = self.project.root.join("Cargo.lock");
-        let current = std::fs::read(&local).unwrap_or_default();
-        if current != out {
-            std::fs::write(&local, &out)?;
-            eprintln!("cargo-remote: updated local Cargo.lock from remote");
-        }
-        Ok(())
+        apply_remote_lockfile(&self.project.root, &out, self.update_lockfile)
     }
+}
+
+/// `KEY=VALUE` → `KEY=***` for status output (env values are often secrets).
+pub(crate) fn mask_env(kv: &str) -> String {
+    match kv.split_once('=') {
+        Some((key, _)) => format!("{key}=***"),
+        None => kv.to_string(),
+    }
+}
+
+/// Apply (or stage for review) a remote Cargo.lock that differs from local.
+///
+/// The remote build is only semi-trusted, so by default the differing
+/// lockfile is written to `Cargo.lock.remote` for review; with `update`
+/// (--update-lockfile) it replaces the local lockfile atomically.
+fn apply_remote_lockfile(root: &Path, remote: &[u8], update: bool) -> Result<()> {
+    if remote.is_empty() {
+        return Ok(());
+    }
+    let local = root.join("Cargo.lock");
+    if std::fs::read(&local).unwrap_or_default() == remote {
+        return Ok(());
+    }
+    if update {
+        let tmp = root.join(".cargo-remote-lockfile-tmp");
+        std::fs::write(&tmp, remote)?;
+        std::fs::rename(&tmp, &local)?;
+        eprintln!("cargo-remote: updated local Cargo.lock from remote");
+    } else {
+        let side = root.join("Cargo.lock.remote");
+        std::fs::write(&side, remote)?;
+        eprintln!(
+            "cargo-remote: remote Cargo.lock differs from local; saved to {} for review \
+             (rerun with --update-lockfile to apply it)",
+            side.display()
+        );
+    }
+    Ok(())
 }
 
 /// Basenames of `command -v`-style output (one absolute path per line).
@@ -902,6 +942,59 @@ mod tests {
         assert!(df_avail("").is_none());
     }
 
+    #[test]
+    fn env_masking() {
+        assert_eq!(mask_env("FOO=bar"), "FOO=***");
+        assert_eq!(mask_env("TOKEN="), "TOKEN=***");
+        assert_eq!(mask_env("A=b=c"), "A=***");
+        assert_eq!(mask_env("NOEQUALS"), "NOEQUALS");
+    }
+
+    #[test]
+    fn remote_lockfile_defaults_to_review_sidecar() {
+        let dir = std::env::temp_dir().join(format!("cr-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Cargo.lock"), b"old").unwrap();
+
+        // A differing remote lockfile goes to the sidecar, not Cargo.lock.
+        apply_remote_lockfile(&dir, b"new", false).unwrap();
+        assert_eq!(std::fs::read(dir.join("Cargo.lock")).unwrap(), b"old");
+        assert_eq!(std::fs::read(dir.join("Cargo.lock.remote")).unwrap(), b"new");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remote_lockfile_opt_in_applies_atomically() {
+        let dir = std::env::temp_dir().join(format!("cr-lock2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Cargo.lock"), b"old").unwrap();
+
+        apply_remote_lockfile(&dir, b"new", true).unwrap();
+        assert_eq!(std::fs::read(dir.join("Cargo.lock")).unwrap(), b"new");
+        assert!(!dir.join(".cargo-remote-lockfile-tmp").exists());
+        assert!(!dir.join("Cargo.lock.remote").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remote_lockfile_noop_cases() {
+        let dir = std::env::temp_dir().join(format!("cr-lock3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Empty remote output: nothing happens.
+        apply_remote_lockfile(&dir, b"", false).unwrap();
+        assert!(!dir.join("Cargo.lock").exists());
+        assert!(!dir.join("Cargo.lock.remote").exists());
+        // Identical content: nothing happens, in either mode.
+        std::fs::write(dir.join("Cargo.lock"), b"same").unwrap();
+        apply_remote_lockfile(&dir, b"same", true).unwrap();
+        apply_remote_lockfile(&dir, b"same", false).unwrap();
+        assert!(!dir.join("Cargo.lock.remote").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ---- Phase-0 hardening: quoting & validators -----------------------
 
     /// Assert no shell metacharacter appears outside single quotes. A
@@ -1078,6 +1171,7 @@ mod tests {
             "h".to_string(),
             remote_base.to_string(),
             Transfer::Auto,
+            false,
             false,
             true,
             false,

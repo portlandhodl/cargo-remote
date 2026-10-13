@@ -114,13 +114,15 @@ fn missing_host_is_an_error() {
 }
 
 #[test]
-fn cargo_remote_toml_provides_host() {
+fn project_config_host_is_ignored_without_trust() {
     let proj = TempProject::new("demo4");
     let mut f = std::fs::File::create(proj.0.join(".cargo-remote.toml")).unwrap();
     write!(f, "host = \"from-config\"\n").unwrap();
     let out = run(&["--dry-run", "sync"], Some(&proj.0));
-    assert!(out.status.success(), "{}", stderr(&out));
-    assert!(stderr(&out).contains("from-config"));
+    assert!(!out.status.success());
+    let err = stderr(&out);
+    assert!(err.contains("ignoring host from .cargo-remote.toml"), "{err}");
+    assert!(err.contains("no remote host"), "{err}");
 }
 
 #[test]
@@ -164,20 +166,44 @@ fn write_config(proj: &TempProject, rel: &str, text: &str) {
 }
 
 #[test]
-fn dot_config_toml_provides_host() {
+fn dot_config_host_is_ignored_without_trust() {
     let proj = TempProject::new("cfg1");
     write_config(&proj, ".config/cargo-remote.toml", "host = \"dot-config-host\"\n");
     let out = run(&["--dry-run", "sync"], Some(&proj.0));
-    assert!(out.status.success(), "{}", stderr(&out));
-    assert!(stderr(&out).contains("dot-config-host"), "{}", stderr(&out));
+    assert!(!out.status.success());
+    let err = stderr(&out);
+    assert!(err.contains("ignoring host from .config/cargo-remote.toml"), "{err}");
+    assert!(err.contains("no remote host"), "{err}");
+}
+
+/// Global config with trust enabled, used by the trusted-* tests below.
+/// Unique per call: tests run in parallel and must not share a global config.
+fn trusting_xdg() -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let xdg = std::env::temp_dir().join(format!(
+        "cargo-remote-test-trust-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&xdg);
+    std::fs::create_dir_all(xdg.join("cargo-remote")).unwrap();
+    std::fs::write(
+        xdg.join("cargo-remote/config.toml"),
+        "trust_project_config = true\n",
+    )
+    .unwrap();
+    xdg
 }
 
 #[test]
-fn root_config_beats_dot_config() {
+fn root_config_beats_dot_config_when_trusted() {
     let proj = TempProject::new("cfg2");
+    let xdg = trusting_xdg();
     write_config(&proj, ".config/cargo-remote.toml", "host = \"dot-config-host\"\n");
     write_config(&proj, ".cargo-remote.toml", "host = \"root-host\"\n");
-    let out = run(&["--dry-run", "sync"], Some(&proj.0));
+    let out = run_env(&["--dry-run", "sync"], Some(&proj.0), &[("XDG_CONFIG_HOME", xdg.to_str().unwrap())]);
+    let _ = std::fs::remove_dir_all(&xdg);
     assert!(out.status.success(), "{}", stderr(&out));
     let err = stderr(&out);
     assert!(err.contains("root-host"), "{err}");
@@ -201,13 +227,12 @@ fn global_config_provides_default_host() {
 }
 
 #[test]
-fn project_config_beats_global() {
+fn project_config_beats_global_when_trusted() {
     let proj = TempProject::new("cfg4");
-    let xdg = std::env::temp_dir().join(format!("cargo-remote-test-gxdg2-{}", std::process::id()));
-    std::fs::create_dir_all(xdg.join("cargo-remote")).unwrap();
+    let xdg = trusting_xdg();
     std::fs::write(
         xdg.join("cargo-remote/config.toml"),
-        "host = \"global-host\"\n",
+        "host = \"global-host\"\ntrust_project_config = true\n",
     )
     .unwrap();
     write_config(&proj, ".config/cargo-remote.toml", "host = \"project-host\"\n");
@@ -220,14 +245,38 @@ fn project_config_beats_global() {
 }
 
 #[test]
+fn project_host_disables_copy_back_by_default() {
+    let proj = TempProject::new("cfg4b");
+    let xdg = trusting_xdg();
+    write_config(&proj, ".cargo-remote.toml", "host = \"project-host\"\n");
+    let out = run_env(&["--dry-run", "build"], Some(&proj.0), &[("XDG_CONFIG_HOME", xdg.to_str().unwrap())]);
+    let _ = std::fs::remove_dir_all(&xdg);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(err.contains("copy-back disabled"), "{err}");
+    assert!(!err.contains("copy-back: fetch"), "{err}");
+}
+
+#[test]
+fn copy_back_flag_forces_on_for_project_host() {
+    let proj = TempProject::new("cfg4c");
+    let xdg = trusting_xdg();
+    write_config(&proj, ".cargo-remote.toml", "host = \"project-host\"\n");
+    let out = run_env(
+        &["--dry-run", "--copy-back=true", "build"],
+        Some(&proj.0),
+        &[("XDG_CONFIG_HOME", xdg.to_str().unwrap())],
+    );
+    let _ = std::fs::remove_dir_all(&xdg);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stderr(&out).contains("copy-back: fetch"), "{}", stderr(&out));
+}
+
+#[test]
 fn config_transfer_mode_is_used() {
     let proj = TempProject::new("cfg5");
-    write_config(
-        &proj,
-        ".config/cargo-remote.toml",
-        "host = \"h\"\ntransfer = \"tar-gz\"\n",
-    );
-    let out = run(&["--dry-run", "sync"], Some(&proj.0));
+    write_config(&proj, ".config/cargo-remote.toml", "transfer = \"tar-gz\"\n");
+    let out = run(&["-r", "h", "--dry-run", "sync"], Some(&proj.0));
     assert!(out.status.success(), "{}", stderr(&out));
     let err = stderr(&out);
     assert!(err.contains("gzip -c"), "missing gzip pipeline: {err}");
@@ -236,12 +285,8 @@ fn config_transfer_mode_is_used() {
 #[test]
 fn config_can_disable_sync() {
     let proj = TempProject::new("cfg6");
-    write_config(
-        &proj,
-        ".config/cargo-remote.toml",
-        "host = \"h\"\nsync = false\n",
-    );
-    let out = run(&["--dry-run", "build"], Some(&proj.0));
+    write_config(&proj, ".config/cargo-remote.toml", "sync = false\n");
+    let out = run(&["-r", "h", "--dry-run", "build"], Some(&proj.0));
     assert!(out.status.success(), "{}", stderr(&out));
     let err = stderr(&out);
     assert!(err.contains("cargo build"), "missing build: {err}");
@@ -266,9 +311,9 @@ fn arch_and_min_rust_version_are_accepted() {
     write_config(
         &proj,
         ".config/cargo-remote.toml",
-        "host = \"h\"\narch = \"host\"\nmin_rust_version = \"1.85\"\n",
+        "arch = \"host\"\nmin_rust_version = \"1.85\"\n",
     );
-    let out = run(&["--dry-run", "build"], Some(&proj.0));
+    let out = run(&["-r", "h", "--dry-run", "build"], Some(&proj.0));
     assert!(out.status.success(), "{}", stderr(&out));
 }
 

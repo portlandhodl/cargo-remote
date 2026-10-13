@@ -3,7 +3,8 @@
 All commands accept the shared options (`-r/--remote`, `--remote-dir`,
 `--transfer`, `--no-sync`, `--exclude-git`, `--exclude`, `--env`,
 `--toolchain`, `-n/--dry-run`, `-v/--verbose`, `--no-sync-status`,
-`--copy-back` / `--no-copy-back`), before or after the subcommand. Anything
+`--copy-back` / `--no-copy-back`, `--update-lockfile`), before or after the
+subcommand. Anything
 after the subcommand that cargo-remote doesn't recognize is passed through
 to the remote cargo.
 
@@ -11,8 +12,9 @@ to the remote cargo.
 
 Sync sources, run `cargo build` on the remote, then copy the produced
 binaries back into the local `target/<profile>/` directory (delta transfer
-when the agent is available). Also refreshes the local `Cargo.lock` if the
-remote build changed it.
+when the agent is available). If the remote `Cargo.lock` changed, it is
+saved to `Cargo.lock.remote` for review (`--update-lockfile` applies it to
+`Cargo.lock` directly).
 
 ```console
 $ cargo remote build --release
@@ -26,9 +28,10 @@ cargo-remote: copy-back: 1 files, 4.2 MiB received in 0.3s (14.0 MiB/s)
 The first `cargo-remote: host ...` line always announces the effective
 configuration before anything is transferred: resolved address, remote dir,
 transfer mode, remote cargo, and any configured constraints. A second line
-lists the exact environment variables sent to the remote build (only shown
-when there are any). Copy-back can be disabled with `--no-copy-back` or
-`copy_back = false` in the config.
+lists the environment variables sent to the remote build, with values
+masked (`KEY=***`; only shown when there are any, and `-v` reveals the
+values). Copy-back can be disabled with `--no-copy-back` or
+`copy_back = false` in the global config.
 
 ## check / clippy / test / run / bench / doc
 

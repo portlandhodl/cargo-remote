@@ -51,23 +51,96 @@ pub struct Config {
     pub arch: Option<String>,
     /// Minimum acceptable remote toolchain version, e.g. "1.85".
     pub min_rust_version: Option<String>,
+    /// Opt-in (global config only): also honor the remote-control keys
+    /// (`host`, `remote_dir`, `cargo_path`, `copy_back`) from project-level
+    /// config files. A project file can never grant this to itself.
+    pub trust_project_config: Option<bool>,
+}
+
+/// Result of merging the configuration layers.
+pub struct LoadOutcome {
+    pub config: Config,
+    /// Warnings about project-file keys that were ignored (one per file).
+    pub warnings: Vec<String>,
+    /// The effective `host` value originated from a project-level file.
+    /// (Only possible when the global config sets trust_project_config.)
+    pub host_from_project: bool,
+}
+
+/// Strip the remote-control keys from a project-level config file.
+fn strip_project_keys(mut c: Config) -> (Config, Vec<&'static str>) {
+    let mut stripped = Vec::new();
+    if c.host.take().is_some() {
+        stripped.push("host");
+    }
+    if c.remote_dir.take().is_some() {
+        stripped.push("remote_dir");
+    }
+    if c.cargo_path.take().is_some() {
+        stripped.push("cargo_path");
+    }
+    if c.copy_back.take().is_some() {
+        stripped.push("copy_back");
+    }
+    // Never honored from a project file: a repo cannot grant itself trust.
+    c.trust_project_config = None;
+    (c, stripped)
 }
 
 impl Config {
     /// Load and merge all config sources for `project_root`.
-    pub fn load(project_root: &Path) -> Result<Config> {
+    ///
+    /// Trust model: the global config (~/.config/cargo-remote/config.toml)
+    /// is fully trusted. Project-level files (`.config/cargo-remote.toml`,
+    /// `.cargo-remote.toml` in the workspace root — typically committed to
+    /// the repo) may set build-shaping keys (`toolchain`, `env`, `transfer`,
+    /// `sync`, `exclude*`, `arch`, `min_rust_version`, display), but the
+    /// remote-control keys — `host`, `remote_dir`, `cargo_path`, `copy_back`
+    /// — are stripped unless the global config sets
+    /// `trust_project_config = true`.
+    pub fn load(project_root: &Path) -> Result<LoadOutcome> {
         Self::load_from(project_root, global_path().as_deref())
     }
 
     /// Merge global < project .config < project root, for tests and [`load`].
-    pub fn load_from(project_root: &Path, global: Option<&Path>) -> Result<Config> {
+    pub fn load_from(project_root: &Path, global: Option<&Path>) -> Result<LoadOutcome> {
         let mut cfg = Config::default();
+        let mut warnings = Vec::new();
+        let mut host_from_project = false;
+
         if let Some(p) = global {
             cfg = cfg.overlay(read(p)?);
         }
-        cfg = cfg.overlay(read(&project_root.join(".config/cargo-remote.toml"))?);
-        cfg = cfg.overlay(read(&project_root.join(".cargo-remote.toml"))?);
-        Ok(cfg)
+        let trusted = cfg.trust_project_config == Some(true);
+
+        for rel in [".config/cargo-remote.toml", ".cargo-remote.toml"] {
+            let path = project_root.join(rel);
+            let Some(c) = read(&path)? else { continue };
+            let c = if trusted {
+                if c.host.is_some() {
+                    host_from_project = true;
+                }
+                c
+            } else {
+                let (clean, stripped) = strip_project_keys(c);
+                if !stripped.is_empty() {
+                    warnings.push(format!(
+                        "ignoring {} from {rel}: project config is untrusted \
+                         (set trust_project_config = true in your global \
+                         cargo-remote config to allow these keys)",
+                        stripped.join(", ")
+                    ));
+                }
+                clean
+            };
+            cfg = cfg.overlay(Some(c));
+        }
+
+        Ok(LoadOutcome {
+            config: cfg,
+            warnings,
+            host_from_project,
+        })
     }
 
     /// Overlay `other` (higher precedence) onto `self`: set scalar fields
@@ -90,6 +163,7 @@ impl Config {
             sync_status: o.sync_status.or(self.sync_status),
             arch: o.arch.or(self.arch),
             min_rust_version: o.min_rust_version.or(self.min_rust_version),
+            trust_project_config: o.trust_project_config.or(self.trust_project_config),
         }
     }
 }
@@ -214,7 +288,7 @@ env = ["A=2"]
     }
 
     #[test]
-    fn load_from_orders_precedence() {
+    fn untrusted_project_config_loses_remote_control_keys() {
         let dir = std::env::temp_dir().join(format!("cargo-remote-cfg-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".config")).unwrap();
@@ -223,11 +297,77 @@ env = ["A=2"]
         std::fs::write(dir.join(".config/cargo-remote.toml"), "host = \"dot-config\"\n").unwrap();
         std::fs::write(dir.join(".cargo-remote.toml"), "remote_dir = \"~/x\"\n").unwrap();
 
-        let cfg = Config::load_from(&dir, Some(&global)).unwrap();
-        // root file has no host -> .config wins over global
-        assert_eq!(cfg.host.as_deref(), Some("dot-config"));
-        assert_eq!(cfg.remote_dir.as_deref(), Some("~/x"));
-        assert_eq!(cfg.verbose, Some(true));
+        let out = Config::load_from(&dir, Some(&global)).unwrap();
+        // Project-level `host`/`remote_dir` are stripped; global `host` wins.
+        assert_eq!(out.config.host.as_deref(), Some("global"));
+        assert_eq!(out.config.remote_dir, None);
+        assert_eq!(out.config.verbose, Some(true));
+        assert!(!out.host_from_project);
+        assert_eq!(out.warnings.len(), 2, "{:?}", out.warnings);
+        assert!(out.warnings[0].contains("host"), "{:?}", out.warnings);
+        assert!(out.warnings[1].contains("remote_dir"), "{:?}", out.warnings);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn trusted_project_config_keeps_remote_control_keys() {
+        let dir = std::env::temp_dir().join(format!("cargo-remote-cfg2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".config")).unwrap();
+        let global = dir.join("global.toml");
+        std::fs::write(&global, "trust_project_config = true\n").unwrap();
+        std::fs::write(dir.join(".config/cargo-remote.toml"), "host = \"dot-config\"\n").unwrap();
+        std::fs::write(dir.join(".cargo-remote.toml"), "remote_dir = \"~/x\"\n").unwrap();
+
+        let out = Config::load_from(&dir, Some(&global)).unwrap();
+        assert_eq!(out.config.host.as_deref(), Some("dot-config"));
+        assert_eq!(out.config.remote_dir.as_deref(), Some("~/x"));
+        assert!(out.warnings.is_empty());
+        assert!(out.host_from_project);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn project_config_cannot_grant_itself_trust() {
+        let dir = std::env::temp_dir().join(format!("cargo-remote-cfg3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".config")).unwrap();
+        // Project file claims trust AND sets a host: both are dropped.
+        std::fs::write(
+            dir.join(".config/cargo-remote.toml"),
+            "trust_project_config = true\nhost = \"evil\"\n",
+        )
+        .unwrap();
+
+        let out = Config::load_from(&dir, None).unwrap();
+        assert_eq!(out.config.host, None);
+        assert_eq!(out.config.trust_project_config, None);
+        assert!(!out.host_from_project);
+        assert_eq!(out.warnings.len(), 1);
+        assert!(out.warnings[0].contains("host"), "{:?}", out.warnings);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn safe_keys_still_flow_from_project_config() {
+        let dir = std::env::temp_dir().join(format!("cargo-remote-cfg4-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(".cargo-remote.toml"),
+            "toolchain = \"nightly\"\nenv = [\"A=1\"]\nsync = false\nexclude = [\"big\"]\n",
+        )
+        .unwrap();
+
+        let out = Config::load_from(&dir, None).unwrap();
+        assert_eq!(out.config.toolchain.as_deref(), Some("nightly"));
+        assert_eq!(out.config.env.unwrap(), vec!["A=1".to_string()]);
+        assert_eq!(out.config.sync, Some(false));
+        assert_eq!(out.config.exclude.unwrap(), vec!["big".to_string()]);
+        assert!(out.warnings.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

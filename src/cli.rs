@@ -114,8 +114,8 @@ pub enum Command {
 pub struct RemoteOpts {
     /// SSH host, as named in ~/.ssh/config.
     ///
-    /// Falls back to $CARGO_REMOTE_HOST, then `host` in a cargo-remote
-    /// config file (.config/cargo-remote.toml, .cargo-remote.toml, global).
+    /// Falls back to $CARGO_REMOTE_HOST, then `host` in your global
+    /// cargo-remote config (~/.config/cargo-remote/config.toml).
     #[arg(short, long, value_name = "HOST", global = false)]
     pub remote: Option<String>,
 
@@ -130,8 +130,16 @@ pub struct RemoteOpts {
     pub transfer: Option<TransferMode>,
 
     /// Copy built binaries back into the local target/ dir after `build`.
+    /// (Enabled by default; always off unless forced when the host came
+    /// from a project-level config file.)
     #[arg(long, overrides_with = "no_copy_back", default_value = None)]
     pub copy_back: Option<bool>,
+
+    /// After a build, apply the remote Cargo.lock to the local checkout
+    /// (atomically). Default: a differing remote lockfile is saved to
+    /// Cargo.lock.remote for review instead.
+    #[arg(long)]
+    pub update_lockfile: bool,
 
     /// Don't copy anything back after a build.
     #[arg(long, overrides_with = "copy_back")]
@@ -184,6 +192,7 @@ impl RemoteOpts {
             remote_dir: other.remote_dir.clone().or_else(|| self.remote_dir.clone()),
             transfer: other.transfer.or(self.transfer),
             copy_back: other.copy_back.or(self.copy_back),
+            update_lockfile: other.update_lockfile || self.update_lockfile,
             no_sync: other.no_sync || self.no_sync,
             exclude_git: other.exclude_git || self.exclude_git,
             exclude: [self.exclude.clone(), other.exclude.clone()].concat(),

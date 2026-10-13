@@ -123,19 +123,27 @@ async fn build_context(global: &RemoteOpts, local: &RemoteOpts, connect: bool) -
 
     let project = Project::discover(std::env::current_dir()?)?;
 
-    let cfg = Config::load(&project.root)?;
+    let outcome = Config::load(&project.root)?;
+    for w in &outcome.warnings {
+        eprintln!("cargo-remote: warning: {w}");
+    }
+    let cfg = outcome.config;
 
-    let host = opts
+    // CLI beats env beats config. `host` in a project-level config file is
+    // honored only with trust_project_config = true in the global config,
+    // and marks the host as less trustworthy (copy-back defaults off).
+    let cli_or_env = opts
         .remote
         .clone()
-        .or_else(|| std::env::var("CARGO_REMOTE_HOST").ok())
+        .or_else(|| std::env::var("CARGO_REMOTE_HOST").ok());
+    let host_from_project = cli_or_env.is_none() && outcome.host_from_project;
+    let host = cli_or_env
         .or_else(|| cfg.host.clone())
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "no remote host given.\n\
                  Use -r <HOST>, set CARGO_REMOTE_HOST, or put `host = \"...\"` in \
-                 .config/cargo-remote.toml\n\
-                 (or ~/.config/cargo-remote/config.toml for all projects).\n\
+                 ~/.config/cargo-remote/config.toml.\n\
                  Run `cargo remote hosts` to see host names from your ~/.ssh/config."
             )
         })?;
@@ -147,6 +155,7 @@ async fn build_context(global: &RemoteOpts, local: &RemoteOpts, connect: bool) -
         .unwrap_or_else(|| "~/remote-builds".to_string());
 
     let interactive = std::io::stdout().is_terminal() && std::io::stdin().is_terminal();
+    let verbose = opts.verbose || cfg.verbose.unwrap_or(false);
 
     // Live sync status only on an interactive stderr, unless disabled by
     // flag or config.
@@ -208,22 +217,40 @@ async fn build_context(global: &RemoteOpts, local: &RemoteOpts, connect: bool) -
             &env,
             &cfg,
             rustflags.as_deref(),
+            verbose,
         ) {
             eprintln!("{line}");
         }
     }
 
+    // Copy-back defaults to off when the host came from a (trusted) project
+    // config file; an explicit --copy-back or copy_back in the global
+    // config forces it.
+    let copy_back = match opts.copy_back.or(cfg.copy_back) {
+        Some(v) => v,
+        None if host_from_project => {
+            eprintln!(
+                "cargo-remote: warning: copy-back disabled — the host came from a \
+                 project config file; pass --copy-back (or set copy_back in your \
+                 global config) to force it on"
+            );
+            false
+        }
+        None => true,
+    };
+
     let mut ctx = Context::new(
         Runner {
             dry_run: opts.dry_run,
-            verbose: opts.verbose || cfg.verbose.unwrap_or(false),
+            verbose,
             sync_status,
         },
         project,
         host,
         remote_dir,
         transfer,
-        opts.copy_back.or(cfg.copy_back).unwrap_or(true),
+        copy_back,
+        opts.update_lockfile,
         !opts.no_sync && cfg.sync.unwrap_or(true),
         opts.exclude_git || cfg.exclude_git.unwrap_or(false),
         [cfg.exclude.clone().unwrap_or_default(), opts.exclude.clone()].concat(),
@@ -254,6 +281,7 @@ fn host_status_lines(
     env: &[String],
     cfg: &Config,
     rustflags: Option<&str>,
+    verbose: bool,
 ) -> Vec<String> {
     let mut line = format!(
         "cargo-remote: host {host} ({}@{}:{}), dir {remote_dir}, transfer {}",
@@ -278,13 +306,20 @@ fn host_status_lines(
     }
 
     let mut lines = vec![line];
-    // The exact env that will prefix the remote cargo command: the
-    // configured pairs plus RUSTFLAGS when forwarded from the local env.
+    // The env that will prefix the remote cargo command: the configured
+    // pairs (values masked — they are often secrets; -v shows them) plus
+    // RUSTFLAGS when forwarded from the local env.
     let mut sent: Vec<String> = Vec::new();
     if let Some(rf) = rustflags {
         sent.push(format!("RUSTFLAGS={rf}"));
     }
-    sent.extend(env.iter().cloned());
+    sent.extend(env.iter().map(|kv| {
+        if verbose {
+            kv.clone()
+        } else {
+            runner::mask_env(kv)
+        }
+    }));
     if !sent.is_empty() {
         lines.push(format!("cargo-remote: env sent: {}", sent.join(" ")));
     }
@@ -320,6 +355,7 @@ mod tests {
             &["FOO=bar".to_string()],
             &cfg,
             Some("-Ctarget-cpu=native"),
+            false,
         );
         assert_eq!(lines.len(), 2);
         assert!(lines[0].contains("host alias (me@10.0.0.2:22)"), "{}", lines[0]);
@@ -334,10 +370,31 @@ mod tests {
             "{}",
             lines[0]
         );
+        // Env values are masked by default; RUSTFLAGS (flags, not secrets)
+        // stays visible.
         assert_eq!(
             lines[1],
-            "cargo-remote: env sent: RUSTFLAGS=-Ctarget-cpu=native FOO=bar"
+            "cargo-remote: env sent: RUSTFLAGS=-Ctarget-cpu=native FOO=***"
         );
+    }
+
+    #[test]
+    fn status_lines_reveal_env_values_in_verbose() {
+        let cfg = Config::default();
+        let lines = host_status_lines(
+            "alias",
+            &conn(),
+            "~/b",
+            &Transfer::Auto,
+            "cargo",
+            None,
+            &["FOO=bar".to_string(), "TOKEN=s3cret".to_string()],
+            &cfg,
+            None,
+            true,
+        );
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[1], "cargo-remote: env sent: FOO=bar TOKEN=s3cret");
     }
 
     #[test]
@@ -353,6 +410,7 @@ mod tests {
             &[],
             &cfg,
             None,
+            false,
         );
         assert_eq!(lines.len(), 1);
         assert!(!lines[0].contains("requires"), "{}", lines[0]);
