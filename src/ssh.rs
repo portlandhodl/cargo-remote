@@ -73,21 +73,34 @@ impl client::Handler for HostKeyHandler {
             }
         };
         let checked = check_known_hosts_path(&self.host, self.port, &key, &self.known_hosts);
+        // Fleet-pinned keys may live only in the system-wide file; consult
+        // it before treating the key as unknown.
+        let checked = match checked {
+            Ok(false) => match check_known_hosts_path(
+                &self.host,
+                self.port,
+                &key,
+                std::path::Path::new("/etc/ssh/ssh_known_hosts"),
+            ) {
+                Ok(true) => return Ok(true),
+                _ => Ok(false),
+            },
+            other => other,
+        };
         match checked {
             Ok(true) => Ok(true),
             Ok(false) => self.unknown_key(&key).await,
-            Err(keys_err) => {
-                // A changed key is reported by russh as Error::KeyChanged.
-                let msg = format!("{keys_err}");
-                if msg.contains("changed") || msg.contains("KeyChanged") {
-                    *self.rejection.lock().unwrap() = Some(format!(
-                        "HOST KEY CHANGED for {}:{} — possible MITM attack!\n  {msg}\n  Remove the old key from {} if this is expected.",
-                        self.host,
-                        self.port,
-                        self.known_hosts.display()
-                    ));
-                    return Ok(false);
-                }
+            Err(russh::keys::Error::KeyChanged { line }) => {
+                *self.rejection.lock().unwrap() = Some(format!(
+                    "HOST KEY CHANGED for {}:{} (known_hosts line {line}) — possible MITM attack!\n  \
+                     Remove the old key from {} if this is expected.",
+                    self.host,
+                    self.port,
+                    self.known_hosts.display()
+                ));
+                Ok(false)
+            }
+            Err(_) => {
                 // e.g. missing known_hosts file: treat as unknown.
                 self.unknown_key(&key).await
             }
@@ -147,8 +160,28 @@ impl Ssh {
     /// authenticate. When `interactive`, unknown host keys may be confirmed
     /// at a prompt.
     pub async fn connect(alias: &str, interactive: bool) -> Result<Ssh> {
-        let cfg = russh_config::parse_home(alias)
-            .unwrap_or_else(|_| russh_config::Config::default(alias));
+        // Fail closed on config parse errors: silently guessing defaults
+        // (wrong hostname/port/user, dropped ProxyCommand/StrictHostKeyChecking)
+        // can steer the connection to the wrong machine.
+        let cfg = match russh_config::parse_home(alias) {
+            Ok(cfg) => cfg,
+            Err(russh_config::Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                // No user config file at all — plain defaults are fine.
+                russh_config::Config::default(alias)
+            }
+            Err(e) => anyhow::bail!(
+                "{alias}: ~/.ssh/config could not be parsed ({e}); refusing to guess defaults.\n  \
+                 Fix the file (leading global options and `Include` are not supported by the \
+                 built-in parser yet) or pass a plain hostname with -r."
+            ),
+        };
+
+        let proxy_none = cfg
+            .host_config
+            .proxy_command
+            .as_deref()
+            .map(|p| p.trim().eq_ignore_ascii_case("none"))
+            .unwrap_or(false);
 
         if cfg.host_config.proxy_jump.is_some() && cfg.host_config.proxy_command.is_none() {
             bail!(
@@ -167,7 +200,13 @@ impl Ssh {
             .map(|p| expand_home(p))
             .or_else(|| std::env::home_dir().map(|h| h.join(".ssh/known_hosts")))
             .ok_or_else(|| anyhow!("could not determine home directory"))?;
-        let strict = cfg.host_config.strict_host_key_checking.unwrap_or(false);
+        // russh-config collapses ask/accept-new into `true`; read the raw
+        // value so those (OpenSSH defaults on many distros) still get the
+        // interactive TOFU flow instead of a dead end.
+        let strict = match crate::sshcfg::strict_host_key_setting(alias).as_deref() {
+            Some(v) => v == "yes",
+            None => cfg.host_config.strict_host_key_checking.unwrap_or(false),
+        };
 
         let rejection: Rejection = Arc::new(Mutex::new(None));
         let handler = HostKeyHandler {
@@ -179,17 +218,30 @@ impl Ssh {
             rejection: rejection.clone(),
         };
 
+        // Offer every default host-key algorithm except SHA-1 `ssh-rsa`
+        // (parent of the RSA verify chain; OpenSSH disabled it in 8.8).
+        let mut preferred = russh::Preferred::default();
+        preferred.key = std::borrow::Cow::Owned(
+            russh::Preferred::DEFAULT
+                .key
+                .iter()
+                .cloned()
+                .filter(|a| !matches!(a, russh::keys::Algorithm::Rsa { hash: None }))
+                .collect(),
+        );
+
         let config = Arc::new(client::Config {
             nodelay: true,
             keepalive_interval: Some(Duration::from_secs(15)),
             // A peer that stops talking entirely stalls forever otherwise.
             inactivity_timeout: Some(Duration::from_secs(600)),
+            preferred,
             ..Default::default()
         });
 
         // Bound the connect+handshake so a stalling peer fails fast.
         let connect_fut = async {
-            if cfg.host_config.proxy_command.is_some() {
+            if cfg.host_config.proxy_command.is_some() && !proxy_none {
                 let stream = cfg
                     .stream()
                     .await
@@ -454,6 +506,18 @@ impl Ssh {
 
 /// Authenticate: ssh-agent identities first, then identity files from the
 /// config (or the usual defaults) with an empty passphrase.
+/// SHA-1 `ssh-rsa` is disabled in modern OpenSSH; when the server never
+/// advertised rsa-sha2 support (`server-sig-algs`), refuse to weaken.
+fn check_rsa_policy(alias: &str, alg: ssh_key::Algorithm, rsa_hash: Option<HashAlg>) -> Result<()> {
+    if alg.as_str() == "ssh-rsa" && rsa_hash.is_none() {
+        bail!(
+            "{alias}: server predates rsa-sha2 (RFC 8332) — refusing to sign with SHA-1. \
+             Use an ed25519/ecdsa key or upgrade the server."
+        );
+    }
+    Ok(())
+}
+
 async fn authenticate(
     handle: &mut Handle<HostKeyHandler>,
     alias: &str,
@@ -471,6 +535,7 @@ async fn authenticate(
                 AgentIdentity::PublicKey { key, .. } => key,
                 AgentIdentity::Certificate { .. } => continue,
             };
+            check_rsa_policy(alias, key.algorithm(), rsa_hash)?;
             if let Ok(res) = handle
                 .authenticate_publickey_with(user.to_string(), key, rsa_hash, &mut agent)
                 .await
@@ -509,6 +574,7 @@ async fn authenticate(
         let Ok(key) = load_secret_key(&path, None) else {
             continue; // missing or passphrase-protected
         };
+        check_rsa_policy(alias, key.public_key().algorithm(), rsa_hash)?;
         if let Ok(res) = handle
             .authenticate_publickey(
                 user.to_string(),

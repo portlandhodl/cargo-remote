@@ -394,8 +394,56 @@ fn trust_flag_only_in_global() {
 }
 
 // -------------------------------------------------------------------------
-// Agent self-attestation (Phase 2): version line carries the binary's hash
+// SSH config parsing fails closed (Phase 3)
 // -------------------------------------------------------------------------
+
+#[test]
+fn unparseable_ssh_config_fails_closed() {
+    let proj = TempProject::new("sshcfg1");
+    let home = std::env::temp_dir().join(format!("cr-sec-home-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(home.join(".ssh")).unwrap();
+    // A leading global option (very common) breaks russh-config 0.58's
+    // parser; the client must refuse rather than guess defaults.
+    std::fs::write(
+        home.join(".ssh/config"),
+        "ServerAliveInterval 30\n\nHost fake\n  HostName 10.255.255.1\n",
+    )
+    .unwrap();
+    let out = run_env(
+        &["probe"],
+        &proj.0,
+        &[("HOME", home.to_str().unwrap()), ("CARGO_REMOTE_HOST", "fake")],
+    );
+    let _ = std::fs::remove_dir_all(&home);
+    assert!(!out.status.success());
+    let err = stderr(&out);
+    assert!(err.contains("could not be parsed"), "{err}");
+}
+
+#[test]
+fn parseable_ssh_config_still_resolves() {
+    let proj = TempProject::new("sshcfg2");
+    let home = std::env::temp_dir().join(format!("cr-sec-home2-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(home.join(".ssh")).unwrap();
+    std::fs::write(
+        home.join(".ssh/config"),
+        "Host fake\n  HostName nonexistent.invalid\n",
+    )
+    .unwrap();
+    let out = run_env(
+        &["probe"],
+        &proj.0,
+        &[("HOME", home.to_str().unwrap()), ("CARGO_REMOTE_HOST", "fake")],
+    );
+    let _ = std::fs::remove_dir_all(&home);
+    let err = stderr(&out);
+    assert!(!out.status.success());
+    assert!(err.contains("connect:"), "{err}");
+    assert!(!err.contains("could not be parsed"), "{err}");
+}
+
 
 #[test]
 fn agent_version_line_includes_self_hash() {
