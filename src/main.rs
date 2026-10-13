@@ -169,6 +169,26 @@ async fn build_context(global: &RemoteOpts, local: &RemoteOpts, connect: bool) -
         TransferMode::TarInc => Transfer::TarIncremental,
     };
 
+    // These values end up inside remote shell command lines, so validate
+    // them here (fail fast, before any network activity) regardless of the
+    // quoting applied at the sinks.
+    let toolchain = opts.toolchain.clone().or_else(|| cfg.toolchain.clone());
+    if let Some(tc) = &toolchain {
+        anyhow::ensure!(
+            runner::is_valid_toolchain(tc),
+            "invalid toolchain name '{tc}': expected [A-Za-z0-9._+-]+"
+        );
+    }
+    let cargo_path = cfg.cargo_path.clone().unwrap_or_else(default_cargo_path);
+    anyhow::ensure!(
+        runner::is_valid_cargo_path(&cargo_path),
+        "invalid cargo_path '{cargo_path}': expected a plain path over \
+         [A-Za-z0-9._+/-] (an optional ~/ or $HOME/ prefix is allowed)"
+    );
+    let env = [cfg.env.clone().unwrap_or_default(), opts.env.clone()].concat();
+    runner::validate_env_entries(&env)?;
+    let rustflags = std::env::var("RUSTFLAGS").ok().filter(|s| !s.is_empty());
+
     // Dry-run never touches the network; probe connects on its own.
     let ssh = if opts.dry_run || !connect {
         None
@@ -176,13 +196,8 @@ async fn build_context(global: &RemoteOpts, local: &RemoteOpts, connect: bool) -
         Some(ssh::Ssh::connect(&host, interactive).await?)
     };
 
-    let toolchain = opts.toolchain.clone().or_else(|| cfg.toolchain.clone());
-    let cargo_path = cfg.cargo_path.clone().unwrap_or_else(default_cargo_path);
-    let env = [cfg.env.clone().unwrap_or_default(), opts.env.clone()].concat();
-
     // Announce where and how we're about to build before anything is sent.
     if let Some(ssh) = &ssh {
-        let rustflags = std::env::var("RUSTFLAGS").ok().filter(|s| !s.is_empty());
         for line in host_status_lines(
             &host,
             ssh.info(),
@@ -213,6 +228,7 @@ async fn build_context(global: &RemoteOpts, local: &RemoteOpts, connect: bool) -
         opts.exclude_git || cfg.exclude_git.unwrap_or(false),
         [cfg.exclude.clone().unwrap_or_default(), opts.exclude.clone()].concat(),
         env,
+        rustflags,
         toolchain,
         interactive,
         cargo_path,

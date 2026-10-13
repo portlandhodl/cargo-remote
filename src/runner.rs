@@ -50,6 +50,8 @@ pub struct Context {
     pub exclude_git: bool,
     pub extra_exclude: Vec<String>,
     pub env: Vec<String>,
+    /// RUSTFLAGS captured at startup (forwarded to the remote build).
+    pub rustflags: Option<String>,
     pub toolchain: Option<String>,
     pub interactive: bool,
     pub cargo_path: String,
@@ -61,7 +63,7 @@ pub struct Context {
 }
 
 impl Context {
-    pub fn new(runner: Runner, project: Project, host: String, remote_base: String, transfer: Transfer, copy_back: bool, sync: bool, exclude_git: bool, extra_exclude: Vec<String>, env: Vec<String>, toolchain: Option<String>, interactive: bool, cargo_path: String, ssh: Option<Ssh>) -> Self {
+    pub fn new(runner: Runner, project: Project, host: String, remote_base: String, transfer: Transfer, copy_back: bool, sync: bool, exclude_git: bool, extra_exclude: Vec<String>, env: Vec<String>, rustflags: Option<String>, toolchain: Option<String>, interactive: bool, cargo_path: String, ssh: Option<Ssh>) -> Self {
         Context {
             runner,
             project,
@@ -73,6 +75,7 @@ impl Context {
             exclude_git,
             extra_exclude,
             env,
+            rustflags,
             toolchain,
             interactive,
             cargo_path,
@@ -103,16 +106,9 @@ impl Context {
         format!("{}/{}", self.remote_base.trim_end_matches('/'), self.project.name)
     }
 
-    /// Quote a remote path under the base dir for use in remote shell
-    /// strings; a leading `~` becomes "$HOME" so it expands inside quotes.
+    /// Quote a remote path for use in remote shell strings.
     pub fn quote_remote(&self, path: &str) -> String {
-        if path == "~" {
-            "\"$HOME\"".to_string()
-        } else if let Some(rest) = path.strip_prefix("~/") {
-            format!("\"$HOME/{}\"", rest.replace('"', "\\\""))
-        } else {
-            format!("\"{}\"", path.replace('"', "\\\""))
-        }
+        quote_remote_path(path)
     }
 
     /// Remote project dir quoted for remote shell strings.
@@ -132,19 +128,24 @@ impl Context {
 
     pub async fn clean(&self) -> Result<u8> {
         self.check_requirements(false).await?;
-        let remote_cmd = self.remote_cargo_command(CargoSubcommand::Clean, &[]);
+        let remote_cmd = self.remote_cargo_command(CargoSubcommand::Clean, &[])?;
         let code = self.exec_remote(&remote_cmd).await?;
         Ok(code as u8)
     }
 
     pub async fn build(&self, cmd: CargoSubcommand, args: &[String]) -> Result<u8> {
+        // Validate the copy-back profile up front so a bad --profile fails
+        // before any sync or build work happens remotely.
+        if cmd == CargoSubcommand::Build && self.copy_back {
+            profile_from_args(args)?;
+        }
         self.check_requirements(cmd == CargoSubcommand::Build && self.copy_back)
             .await?;
         if self.sync {
             self.do_sync().await?;
         }
 
-        let remote_cmd = self.remote_cargo_command(cmd, args);
+        let remote_cmd = self.remote_cargo_command(cmd, args)?;
         let code = self.exec_remote(&remote_cmd).await?;
         if code != 0 {
             return Ok(code as u8);
@@ -165,7 +166,7 @@ impl Context {
         if self.sync {
             self.do_sync().await?;
         }
-        let remote_cmd = self.remote_cargo_words(argv);
+        let remote_cmd = self.remote_cargo_words(argv)?;
         let code = self.exec_remote(&remote_cmd).await?;
         Ok(code as u8)
     }
@@ -182,33 +183,35 @@ impl Context {
             .await
     }
 
-    fn remote_cargo_command(&self, cmd: CargoSubcommand, args: &[String]) -> String {
+    fn remote_cargo_command(&self, cmd: CargoSubcommand, args: &[String]) -> Result<String> {
         let words: Vec<String> = std::iter::once(cmd.as_str().to_string())
             .chain(args.iter().cloned())
             .collect();
         self.remote_cargo_words(&words)
     }
 
+    /// The remote cargo invocation (`cargo_path`, optional `+toolchain`),
+    /// quoted for the remote shell.
+    fn cargo_program(&self) -> String {
+        let cargo = quote_remote_path(&self.cargo_path);
+        match &self.toolchain {
+            Some(tc) => format!("{cargo} +{}", shell_quote(tc)),
+            None => cargo,
+        }
+    }
+
     /// Build the remote shell line for `cargo <words...>` (with env,
     /// toolchain shim, and cd into the remote project dir).
-    fn remote_cargo_words(&self, words: &[String]) -> String {
+    fn remote_cargo_words(&self, words: &[String]) -> Result<String> {
         let mut parts: Vec<String> = Vec::new();
 
         // Forward RUSTFLAGS if set locally, plus any --env KEY=VAL pairs.
-        if let Ok(rf) = std::env::var("RUSTFLAGS")
-            && !rf.is_empty()
-        {
-            parts.push(format!("RUSTFLAGS={}", shell_quote(&rf)));
+        if let Some(rf) = &self.rustflags {
+            parts.push(format!("RUSTFLAGS={}", shell_quote(rf)));
         }
-        for kv in &self.env {
-            parts.push(kv.clone());
-        }
+        push_env_prefix(&mut parts, &self.env)?;
 
-        let cargo = if let Some(tc) = &self.toolchain {
-            format!("{} +{}", self.cargo_path, tc)
-        } else {
-            self.cargo_path.clone()
-        };
+        let cargo = self.cargo_program();
 
         let env = if parts.is_empty() {
             String::new()
@@ -216,13 +219,13 @@ impl Context {
             format!("{} ", parts.join(" "))
         };
 
-        format!(
+        Ok(format!(
             "cd {} && {}{} {}",
             self.remote_dir_q(),
             env,
             cargo,
             shell_join(words.iter().map(|s| s.as_str()))
-        )
+        ))
     }
 
     /// Verify the remote satisfies the configured `arch` and
@@ -267,10 +270,7 @@ impl Context {
         }
 
         if let Some(min) = &self.requirements.min_rust_version {
-            let cargo = match &self.toolchain {
-                Some(tc) => format!("{} +{}", self.cargo_path, tc),
-                None => self.cargo_path.clone(),
-            };
+            let cargo = self.cargo_program();
             let (_, out) = ssh.exec_capture(&format!("{cargo} --version")).await?;
             let text = String::from_utf8_lossy(&out);
             let got = parse_version(&text).with_context(|| {
@@ -316,9 +316,7 @@ impl Context {
             eprintln!("  requires:  {}", reqs.join(", "));
         }
         let mut sent: Vec<String> = Vec::new();
-        if let Ok(rf) = std::env::var("RUSTFLAGS")
-            && !rf.is_empty()
-        {
+        if let Some(rf) = &self.rustflags {
             sent.push(format!("RUSTFLAGS={rf}"));
         }
         sent.extend(self.env.iter().cloned());
@@ -376,10 +374,7 @@ impl Context {
         }
 
         // Toolchain on the remote.
-        let cargo = match &self.toolchain {
-            Some(tc) => format!("{} +{}", self.cargo_path, tc),
-            None => self.cargo_path.clone(),
-        };
+        let cargo = self.cargo_program();
         let (code, out) = ssh.exec_capture(&format!("{cargo} --version")).await?;
         if code == 0 {
             let text = String::from_utf8_lossy(&out).trim().to_string();
@@ -580,6 +575,20 @@ impl Context {
             bail!("agent upload failed with exit code {code}");
         }
         progress.finish(&format!("uploaded {}", human(total)));
+
+        // uname matching is not enough: the binary must also start (older
+        // remote glibc, noexec mounts, ... all refuse it). Verify, and let
+        // the caller fall back to tar when the agent can't run.
+        let (_, out) = ssh
+            .exec_capture(&format!("{path_q} __agent --version 2>/dev/null"))
+            .await?;
+        if String::from_utf8_lossy(&out).trim() != want {
+            eprintln!(
+                "cargo-remote: sync agent does not run on {} (binary incompatible, e.g. newer glibc required); using tar transfer",
+                self.host
+            );
+            return Ok(None);
+        }
         Ok(Some(path_q))
     }
 
@@ -587,7 +596,7 @@ impl Context {
     /// them into the local target/<profile>/ dir (delta transfer when the
     /// agent is available). Also refreshes Cargo.lock if it changed.
     async fn copy_back_binaries(&self, args: &[String]) -> Result<()> {
-        let profile = profile_from_args(args);
+        let profile = profile_from_args(args)?;
         if self.runner.dry_run {
             self.runner.show_line(&format!(
                 "copy-back: fetch binaries from target/{profile}, refresh Cargo.lock"
@@ -726,6 +735,89 @@ fn parse_version(s: &str) -> Result<(u64, u64, u64)> {
     Ok((next()?, next()?, next()?))
 }
 
+/// Quote a path for a remote shell string, preserving HOME expansion:
+/// `~`, `$HOME`, `~/x`, `$HOME/x` emit an unquoted `"$HOME"` prefix and a
+/// single-quoted (expansion-inert) remainder. Everything else goes through
+/// [`shell_quote`], so metacharacters (`$`, backticks, whitespace, quotes)
+/// can never break out.
+pub(crate) fn quote_remote_path(path: &str) -> String {
+    if path == "~" || path == "$HOME" {
+        "\"$HOME\"".to_string()
+    } else if let Some(rest) = path
+        .strip_prefix("~/")
+        .or_else(|| path.strip_prefix("$HOME/"))
+    {
+        format!("\"$HOME\"/{}", shell_quote(rest))
+    } else {
+        shell_quote(path)
+    }
+}
+
+/// Environment variable names must be POSIX shell identifiers.
+pub(crate) fn is_valid_env_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Reject malformed KEY=VALUE pairs from config/CLI before they ever reach
+/// a remote command line.
+pub(crate) fn validate_env_entries(env: &[String]) -> Result<()> {
+    for kv in env {
+        let (key, _) = kv
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("invalid env entry '{kv}': expected KEY=VALUE"))?;
+        anyhow::ensure!(
+            is_valid_env_key(key),
+            "invalid env variable name '{key}': expected [A-Za-z_][A-Za-z0-9_]*"
+        );
+    }
+    Ok(())
+}
+
+/// rustup toolchain names ("stable", "nightly", "1.85.0", "nightly-2025-01-01").
+pub(crate) fn is_valid_toolchain(s: &str) -> bool {
+    !s.is_empty()
+        && s
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-'))
+}
+
+/// `cargo_path` is emitted into the remote shell as the program to run, so
+/// it must be a plain name/path over shell-inert characters, optionally
+/// rooted at `~/` or `$HOME/`.
+pub(crate) fn is_valid_cargo_path(s: &str) -> bool {
+    let rest = s
+        .strip_prefix("~/")
+        .or_else(|| s.strip_prefix("$HOME/"))
+        .unwrap_or(s);
+    !rest.is_empty()
+        && !rest.starts_with('-')
+        && rest
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '/' | '-'))
+}
+
+/// Push `KEY=VALUE` pairs onto a remote command's env prefix, validating
+/// keys and single-quoting values so config/CLI-supplied data can never
+/// execute on the remote shell.
+fn push_env_prefix(parts: &mut Vec<String>, env: &[String]) -> Result<()> {
+    for kv in env {
+        let (key, value) = kv
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("invalid env entry '{kv}': expected KEY=VALUE"))?;
+        anyhow::ensure!(
+            is_valid_env_key(key),
+            "invalid env variable name '{key}': expected [A-Za-z_][A-Za-z0-9_]*"
+        );
+        parts.push(format!("{key}={}", shell_quote(value)));
+    }
+    Ok(())
+}
+
 /// Shell-quote a string for POSIX sh (single-quote style).
 pub fn shell_quote(s: &str) -> String {
     if !s.is_empty()
@@ -808,5 +900,380 @@ mod tests {
         let out = "Filesystem      Size  Used Avail Use% Mounted on\n/dev/sda1       100G   40G   60G  40% /\n";
         assert_eq!(df_avail(out).as_deref(), Some("60G"));
         assert!(df_avail("").is_none());
+    }
+
+    // ---- Phase-0 hardening: quoting & validators -----------------------
+
+    /// Assert no shell metacharacter appears outside single quotes. A
+    /// leading `"$HOME"` prefix is intentional (quoted, unquoted-var-safe)
+    /// and skipped.
+    fn assert_single_quote_inert(s: &str) {
+        let s = s.strip_prefix("\"$HOME\"").unwrap_or(s);
+        let b = s.as_bytes();
+        let mut in_q = false;
+        let mut i = 0;
+        while i < b.len() {
+            match b[i] {
+                b'\'' if !in_q => in_q = true,
+                b'\'' if in_q && i + 3 < b.len() && &b[i..i + 4] == b"'\\''" => i += 3,
+                b'\'' => in_q = false,
+                c if !in_q => assert!(
+                    !b"$`|&;<>()\\\"' \t\n".contains(&c),
+                    "metachar {:?} outside single quotes in {:?}",
+                    c as char, s
+                ),
+                _ => {}
+            }
+            i += 1;
+        }
+        assert!(!in_q, "unbalanced single quotes in {s:?}");
+    }
+
+    const PAYLOADS: &[&str] = &[
+        "$(touch \"$CR_CANARY\")",
+        "`touch \"$CR_CANARY\"`",
+        "; touch \"$CR_CANARY\"",
+        "| touch \"$CR_CANARY\"",
+        "&& touch \"$CR_CANARY\"",
+        "|| touch \"$CR_CANARY\"; true",
+        "> \"$CR_CANARY\"",
+        "\"; touch \"$CR_CANARY\" #",
+        "'; touch \"$CR_CANARY\" #",
+        "\ntouch \"$CR_CANARY\"",
+        " ${CR_CANARY:+touch \"$CR_CANARY\"} ",
+    ];
+
+    #[test]
+    fn quote_remote_path_legit_forms() {
+        assert_eq!(quote_remote_path("~"), "\"$HOME\"");
+        assert_eq!(quote_remote_path("$HOME"), "\"$HOME\"");
+        assert_eq!(
+            quote_remote_path("~/remote-builds/proj"),
+            "\"$HOME\"/remote-builds/proj"
+        );
+        assert_eq!(quote_remote_path("$HOME/x/y-2.z"), "\"$HOME\"/x/y-2.z");
+        assert_eq!(quote_remote_path("/opt/builds/p"), "/opt/builds/p");
+        assert_eq!(quote_remote_path("rel/path"), "rel/path");
+    }
+
+    #[test]
+    fn quote_remote_path_metachars_are_single_quoted() {
+        for p in PAYLOADS {
+            assert_single_quote_inert(&quote_remote_path(&format!("~/x{p}")));
+            assert_single_quote_inert(&quote_remote_path(&format!("/x{p}")));
+            assert_single_quote_inert(&quote_remote_path(&format!("plain{p}")));
+        }
+        // Exact forms for the classic cases.
+        assert_eq!(quote_remote_path("~/a$(id)"), "\"$HOME\"/'a$(id)'");
+        assert_eq!(quote_remote_path("/x/`id`"), "'/x/`id`'");
+        assert_eq!(
+            quote_remote_path("/x/it'$(id)"),
+            "'/x/it'\\''$(id)'"
+        );
+        assert_eq!(quote_remote_path("a b"), "'a b'");
+    }
+
+    #[test]
+    fn env_key_rules() {
+        for good in ["A", "RUST_LOG", "_", "X1", "A_B_C9"] {
+            assert!(is_valid_env_key(good), "{good}");
+        }
+        for bad in ["", "1A", "A-B", "A B", "A$B", "A'B", "A.B", "A\nB"] {
+            assert!(!is_valid_env_key(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn env_entries_validation() {
+        assert!(validate_env_entries(&[]).is_ok());
+        assert!(
+            validate_env_entries(&["A=b".into(), "RUST_LOG=".into(), "_X=$(id)".into()]).is_ok()
+        );
+        for bad in ["FOO", "", "=x", "1A=x", "A-B=x", "A\tB=x"] {
+            assert!(validate_env_entries(&[bad.into()]).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn env_prefix_quotes_values() {
+        let mut parts = Vec::new();
+        push_env_prefix(&mut parts, &["A=simple".into(), "B=two words".into()]).unwrap();
+        assert_eq!(parts, ["A=simple", "B='two words'"]);
+        let mut parts = Vec::new();
+        push_env_prefix(&mut parts, &["X=v$(id)`id`;id".into()]).unwrap();
+        assert_eq!(parts, ["X='v$(id)`id`;id'"]);
+        // Values may be empty; keys that are not identifiers are rejected.
+        let mut parts = Vec::new();
+        push_env_prefix(&mut parts, &["E=".into()]).unwrap();
+        assert_eq!(parts, ["E=''"]);
+        for bad in ["NOEQUALS", "1X=y", "X-Y=z"] {
+            let mut parts = Vec::new();
+            assert!(push_env_prefix(&mut parts, &[bad.into()]).is_err(), "{bad}");
+            assert!(parts.is_empty());
+        }
+    }
+
+    #[test]
+    fn toolchain_rules() {
+        for good in ["stable", "nightly", "1.85.0", "nightly-2025-01-01", "1.85+components"] {
+            assert!(is_valid_toolchain(good), "{good}");
+        }
+        for bad in [
+            "", "nightly;id", "nightly$(id)", "`id`", "nightly x", "x|y", "x&y", "x\"y", "x'y",
+            "x\ny", "x$",
+        ] {
+            assert!(!is_valid_toolchain(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn cargo_path_rules() {
+        for good in [
+            "cargo",
+            "/usr/bin/cargo",
+            "$HOME/.cargo/bin/cargo",
+            "~/.cargo/bin/cargo",
+            "/opt/rust-1.85.0/bin/cargo",
+            "cargo-beta",
+        ] {
+            assert!(is_valid_cargo_path(good), "{good}");
+        }
+        for bad in [
+            "",
+            "$HOME",
+            "~/",
+            "-x",
+            "cargo;id",
+            "cargo$(id)",
+            "cargo x",
+            "x|y",
+            "x&y",
+            "x\"y",
+            "x'y",
+            "x`y`",
+            "x\ny",
+            "$HOME/$(id)/cargo",
+        ] {
+            assert!(!is_valid_cargo_path(bad), "{bad}");
+        }
+    }
+
+    fn test_context(
+        env: Vec<String>,
+        rustflags: Option<&str>,
+        toolchain: Option<&str>,
+        cargo_path: &str,
+        remote_base: &str,
+    ) -> Context {
+        Context::new(
+            Runner {
+                dry_run: true,
+                verbose: false,
+                sync_status: false,
+            },
+            Project {
+                root: PathBuf::from("/tmp/proj"),
+                name: "demo".to_string(),
+            },
+            "h".to_string(),
+            remote_base.to_string(),
+            Transfer::Auto,
+            false,
+            true,
+            false,
+            vec![],
+            env,
+            rustflags.map(|s| s.to_string()),
+            toolchain.map(|s| s.to_string()),
+            false,
+            cargo_path.to_string(),
+            None,
+        )
+    }
+
+    #[test]
+    fn remote_cargo_line_construction() {
+        // Valid config produces the expected, still-readable line.
+        let ctx = test_context(
+            vec!["FOO=a b".into(), "BAR=1".into()],
+            Some("-Ctarget-cpu=native"),
+            Some("nightly"),
+            "$HOME/.cargo/bin/cargo",
+            "~/remote-builds",
+        );
+        let line = ctx.remote_cargo_words(&["build".into(), "--release".into()]).unwrap();
+        assert_eq!(
+            line,
+            "cd \"$HOME\"/remote-builds/demo && RUSTFLAGS=-Ctarget-cpu=native FOO='a b' BAR=1 \
+             \"$HOME\"/.cargo/bin/cargo +nightly build --release"
+        );
+        // Malformed env entries are rejected even without main.rs validation.
+        let ctx = test_context(vec!["NOEQUALS".into()], None, None, "cargo", "~/b");
+        assert!(ctx.remote_cargo_words(&["check".into()]).is_err());
+
+        // A fully poisoned context (validation bypassed) must still emit a
+        // line whose every injected character is inside single quotes.
+        let ctx = test_context(
+            vec!["FOO=v$(id)`id`;id".into()],
+            Some("-Cfoo$(id)"),
+            Some("n$(id)"),
+            "cargo; id",
+            "~/b$(id)",
+        );
+        let line = ctx.remote_cargo_words(&["build".into()]).unwrap();
+        eprintln!("constructed line: {line}");
+        // The only legitimate occurrences of shell syntax in the line are
+        // the word separators; the poisoned fragments must appear verbatim
+        // inside a single-quoted region. Verify by checking each payload
+        // substring sits inside quotes.
+        for frag in ["$(id)", "`id`", ";id", "; id"] {
+            let mut start = 0;
+            while let Some(ix) = line[start..].find(frag) {
+                let abs = start + ix;
+                // Count unescaped single quotes before the fragment.
+                let mut in_q = false;
+                let bytes = line.as_bytes();
+                let mut i = 0;
+                while i < abs {
+                    match bytes[i] {
+                        b'\'' if !in_q => in_q = true,
+                        b'\'' if in_q && i + 3 < bytes.len() && &bytes[i..i + 4] == b"'\\''" => i += 3,
+                        b'\'' => in_q = false,
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                assert!(in_q, "{frag:?} outside single quotes in {line:?}");
+                start = abs + frag.len();
+            }
+        }
+    }
+
+    // ---- Live POSIX sh canary tests (the source of truth for quoting) --
+
+    #[cfg(unix)]
+    mod sh_proof {
+        use super::*;
+        use std::sync::atomic::AtomicU64;
+
+        static N: AtomicU64 = AtomicU64::new(0);
+
+        /// A fresh nonexistent canary path for one test step.
+        struct Canary(PathBuf);
+        impl Canary {
+            fn new(tag: &str) -> (Self, String) {
+                let id = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let p = std::env::temp_dir().join(format!(
+                    "cr-canary-{tag}-{}-{id}",
+                    std::process::id()
+                ));
+                let _ = std::fs::remove_file(&p);
+                let (c, s) = (Self(p.clone()), p.to_str().unwrap().to_string());
+                (c, s)
+            }
+            fn fired(&self) -> bool {
+                self.0.exists()
+            }
+        }
+
+        fn sh(line: &str, envs: &[(&str, &str)]) -> std::process::ExitStatus {
+            let mut c = std::process::Command::new("sh");
+            c.arg("-c").arg(line);
+            for (k, v) in envs {
+                c.env(k, v);
+            }
+            c.status().expect("spawn sh")
+        }
+
+        #[test]
+        fn quote_remote_path_blocks_substitution_in_sh() {
+            let (canary, cpath) = Canary::new("q");
+            for p in PAYLOADS {
+                for base in ["~/x", "/x", "plain"] {
+                    let q = quote_remote_path(&format!("{base}{p}"));
+                    // `cd` will fail (dir does not exist) — but if quoting
+                    // were broken, the payload would execute before that.
+                    let status = sh(&format!("cd {q} && exit 3"), &[("CR_CANARY", &cpath)]);
+                    assert!(!status.success());
+                    assert!(
+                        !canary.fired(),
+                        "payload executed via {base}{p:?} -> {q}: {cpath}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn quote_remote_path_still_navigates_real_dirs() {
+            // A dir with spaces under a fake HOME: cd must succeed.
+            let home = std::env::temp_dir().join(format!("cr-home-{}", std::process::id()));
+            let sub = home.join("my proj");
+            std::fs::create_dir_all(&sub).unwrap();
+            let q = quote_remote_path("~/my proj");
+            let status = sh(
+                &format!("cd {q} && touch ok"),
+                &[("HOME", home.to_str().unwrap())],
+            );
+            assert!(status.success(), "cd {q} failed");
+            assert!(sub.join("ok").exists());
+            let _ = std::fs::remove_dir_all(&home);
+        }
+
+        #[test]
+        fn remote_cargo_line_blocks_all_poisoned_fields_in_sh() {
+            let (c0, p0) = Canary::new("r");
+            let (c1, p1) = Canary::new("a");
+            let (c2, p2) = Canary::new("b");
+            let (c3, p3) = Canary::new("c");
+            let (c4, p4) = Canary::new("d");
+            let ctx = test_context(
+                vec![
+                    format!("FOO=v$(touch \"$CR1\")"),
+                    format!("BAR=`touch \"$CR2\"`"),
+                ],
+                Some("-Cfoo$(touch \"$CR0\")"),
+                Some("n$(touch \"$CR3\")"),
+                "cargo; touch \"$CR4\"",
+                "~/b$(touch \"$CR1\")",
+            );
+            let line = ctx.remote_cargo_words(&["build".into()]).unwrap();
+            let status = sh(
+                &line,
+                &[
+                    ("CR0", &p0),
+                    ("CR1", &p1),
+                    ("CR2", &p2),
+                    ("CR3", &p3),
+                    ("CR4", &p4),
+                ],
+            );
+            // The line may fail (cd into nonexistent dir) but must never
+            // have executed any payload.
+            let _ = status;
+            for (c, p) in [(&c0, &p0), (&c1, &p1), (&c2, &p2), (&c3, &p3), (&c4, &p4)] {
+                assert!(!c.fired(), "payload executed from line {line:?} -> {p}");
+            }
+        }
+
+        #[test]
+        fn env_prefix_preserves_values_byte_for_byte() {
+            let (out, out_path) = Canary::new("out");
+            let (canary, can_path) = Canary::new("e");
+            let value = "v$(touch \"$CR_CANARY\")`id`'q \"w\" \t tab \n nl $HOME ~ */;|&<>";
+            let mut parts = Vec::new();
+            push_env_prefix(&mut parts, &[format!("FOO={value}")]).unwrap();
+            let prefix = format!("{} ", parts.join(" "));
+            // Write the value back out from inside sh; it must round-trip
+            // exactly and never execute.
+            let line = format!("{prefix}sh -c 'printf %s \"$FOO\" > \"$CR_OUT\"'");
+            let status = sh(&line, &[("CR_OUT", &out_path), ("CR_CANARY", &can_path)]);
+            assert!(status.success(), "line failed: {line}");
+            assert!(!canary.fired(), "value payload executed: {line}");
+            assert_eq!(
+                std::fs::read_to_string(&out.0).unwrap(),
+                value,
+                "value did not round-trip"
+            );
+        }
     }
 }
