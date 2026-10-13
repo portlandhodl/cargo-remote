@@ -1,0 +1,30 @@
+name: security
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  schedule:
+    # New advisories appear even when the code doesn't change.
+    - cron: "0 6 * * 1"
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo audit
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked
+      # The security suite shells out to POSIX sh and exercises quoting.
+      - name: tests under release profile (overflow-checks parity)
+        run: cargo test --release

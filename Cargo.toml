@@ -25,3 +25,7 @@ libc = "0.2"
 [profile.release]
 lto = true
 codegen-units = 1
+# Integer wraparound must panic, not wrap silently — this tool is I/O-bound,
+# so the cost is nil; arithmetic bugs in protocol offset math become clean
+# failures instead of memory bugs.
+overflow-checks = true

@@ -220,15 +220,17 @@ impl Ssh {
 
         // Offer every default host-key algorithm except SHA-1 `ssh-rsa`
         // (parent of the RSA verify chain; OpenSSH disabled it in 8.8).
-        let mut preferred = russh::Preferred::default();
-        preferred.key = std::borrow::Cow::Owned(
-            russh::Preferred::DEFAULT
-                .key
-                .iter()
-                .cloned()
-                .filter(|a| !matches!(a, russh::keys::Algorithm::Rsa { hash: None }))
-                .collect(),
-        );
+        let preferred = russh::Preferred {
+            key: std::borrow::Cow::Owned(
+                russh::Preferred::DEFAULT
+                    .key
+                    .iter()
+                    .filter(|a| !matches!(a, russh::keys::Algorithm::Rsa { hash: None }))
+                    .cloned()
+                    .collect(),
+            ),
+            ..Default::default()
+        };
 
         let config = Arc::new(client::Config {
             nodelay: true,
